@@ -39,11 +39,32 @@ pub struct CoverCache {
     /// UI 线程被淹没，表现为界面点不动。这里记住淘汰项，只允许用户显式重试。
     evicted: std::collections::HashSet<String>,
     loader: Option<Arc<dyn CoverLoader>>,
+    /// 本地生成的纹理（二维码等），与封面共用容量与淘汰策略。
+    generated: HashMap<String, TextureHandle>,
 }
 
 impl CoverCache {
     pub fn get(&self, url: &str) -> Option<CoverImage> {
         self.entries.get(url).cloned()
+    }
+
+    /// 二维码纹理：`payload` 是链接（本地编码）或 base64 图片；同 key 复用纹理。
+    ///
+    /// 编码/解码只在内容变化时做一次：扫码轮询每秒更新状态，URL 不变时
+    /// 不重复生成。图片渠道失败（base64 损坏）时返回 `None`，界面只显示状态文字。
+    pub fn qr_texture(&mut self, ctx: &Context, key: &str, payload: &str) -> Option<TextureHandle> {
+        if let Some(texture) = self.generated.get(key) {
+            return Some(texture.clone());
+        }
+        let image = qr_code_image(payload)?;
+        let size = [image.width() as usize, image.height() as usize];
+        let color_image = eframe::egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+        let texture = ctx.load_texture(format!("qr:{key}"), color_image, TextureOptions::NEAREST);
+        if self.generated.len() >= CACHE_CAPACITY {
+            self.generated.clear();
+        }
+        self.generated.insert(key.to_string(), texture.clone());
+        Some(texture)
     }
 
     /// 请求加载一张封面；已缓存、已在途或已被淘汰时什么也不做。
@@ -160,6 +181,7 @@ impl Clone for CoverCache {
             pending: self.pending.clone(),
             evicted: self.evicted.clone(),
             loader: self.loader.clone(),
+            generated: self.generated.clone(),
         }
     }
 }
@@ -260,6 +282,41 @@ async fn decode(service: &CoverService, url: &str) -> Option<image::RgbaImage> {
     Some(downscale(image))
 }
 
+/// 二维码 payload → RGBA：base64 图片直接解码，链接用 `qrcode` 本地编码。
+pub fn qr_code_image(payload: &str) -> Option<image::RgbaImage> {
+    use base64::Engine;
+
+    // `data:image/png;base64,...` 取逗号后的部分；纯 base64 直接用。
+    let body = payload
+        .split_once(',')
+        .filter(|(header, _)| header.contains(";base64"))
+        .map_or(payload, |(_, body)| body);
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(body.trim())
+        && let Ok(image) = image::load_from_memory(&decoded)
+    {
+        return Some(image.to_rgba8());
+    }
+    let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
+    let width = code.width();
+    let module: u32 = 8;
+    let quiet: u32 = 2;
+    let side = (width as u32 + quiet * 2) * module;
+    Some(image::RgbaImage::from_fn(side, side, |x, y| {
+        let mx = (x / module).saturating_sub(quiet) as usize;
+        let my = (y / module).saturating_sub(quiet) as usize;
+        let dark = x / module >= quiet
+            && y / module >= quiet
+            && mx < width
+            && my < width
+            && code[(mx, my)] == qrcode::Color::Dark;
+        if dark {
+            image::Rgba([17, 17, 27, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    }))
+}
+
 /// 把任意尺寸封面缩到 GPU 友好的大小（等比）。
 ///
 /// 这是纯 CPU 的活，只应在解码线程里调用（见 [`decode`]），不要放到 UI
@@ -289,7 +346,7 @@ pub fn load_decoded(service: &CoverService, url: &str) -> Option<image::RgbaImag
 
 #[cfg(test)]
 mod tests {
-    use super::{CoverCache, CoverImage, CoverLoader, CoverResults, downscale};
+    use super::{CoverCache, CoverImage, CoverLoader, CoverResults, downscale, qr_code_image};
     use crate::cover::Context;
     use std::sync::{Arc, Mutex};
 
@@ -324,6 +381,16 @@ mod tests {
                 .get(&format!("u{}", super::CACHE_CAPACITY + 2))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn qr_payloads_encode_to_square_images() {
+        // 链接（网易云/酷狗等渠道）在本地用 qrcode 编码。
+        let image = qr_code_image("https://example.com/login?key=abc").expect("链接可编码");
+        assert_eq!(image.width(), image.height());
+        assert!(image.width() >= 100, "二维码应有足够的分辨率");
+        // 而不是二维码的普通文本也不应 panic（编码失败返回 None 或可编码）。
+        let _ = qr_code_image("plain text");
     }
 
     #[test]

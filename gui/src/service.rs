@@ -17,13 +17,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use lx_core::model::config::Config;
 use lx_core::model::song::SongInfo;
 use lx_core::model::source::{PlayerState, SourceId};
 use lx_core::traits::player::PlayerBackend;
+use lx_source::manager::SourceManager;
 use tokio::sync::mpsc;
-use voicefox_application::{ApplicationCommand, ApplicationEvent, ApplicationService};
+use voicefox_application::{
+    ApplicationCommand, ApplicationEvent, ApplicationService, ApplicationState,
+};
 use voicefox_runtime::ApplicationRuntime;
+use voicefox_runtime::download::DownloadManager;
 use voicefox_runtime::media::{self, MediaSession, PlayMode};
+use voicefox_runtime::storage::Storage;
 
 /// 服务层的错误：只保留面向用户的文案。
 #[derive(Debug, Clone)]
@@ -107,6 +113,104 @@ pub struct SearchView {
 pub struct LyricsView {
     pub lines: Vec<String>,
     pub current: usize,
+    /// 当前行的翻译（配置打开翻译时由核心给出）。
+    pub translation: Option<String>,
+    /// 逐字歌词（YRC）：当前行的词与起止时间，供 karaoke 高亮。
+    pub words: Vec<LyricWord>,
+}
+
+/// 逐字歌词的一小段。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LyricWord {
+    pub text: String,
+    pub start_ms: u64,
+    pub duration_ms: u64,
+}
+
+/// 歌词页的可切换显示项（对应核心的 `lyric.show_translation` / `show_yrc`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LyricToggle {
+    Translation,
+    Yrc,
+}
+
+/// 收藏 / 历史 / 歌单页的数据。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LibraryView {
+    pub favorites: Vec<TrackView>,
+    pub history: Vec<TrackView>,
+    pub playlists: Vec<PlaylistView>,
+    /// 当前打开的歌单（`None` 表示只看列表）。
+    pub selected: Option<PlaylistView>,
+    pub error: Option<String>,
+}
+
+/// 自建歌单。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistView {
+    pub id: String,
+    pub name: String,
+    pub song_count: u32,
+    /// 打开后可见的歌曲（列表页为空）。
+    pub songs: Vec<TrackView>,
+}
+
+/// 音源切换与扫码登录状态。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourcesView {
+    /// 可用的在线音源（顺序即界面顺序）。
+    pub available: Vec<String>,
+    pub enabled: Vec<String>,
+    pub default: String,
+    /// 已登录的音源（音源只保存 cookie，界面只显示是否已登录）。
+    pub logged_in: Vec<String>,
+    pub login: Option<LoginView>,
+    pub error: Option<String>,
+}
+
+/// 扫码登录进度。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginView {
+    pub source: String,
+    /// 二维码内容：链接或图片 base64（QQ 走图片）。
+    pub url: String,
+    pub image_base64: Option<String>,
+    pub status: String,
+    pub message: String,
+    /// 二维码是否仍在轮询中。
+    pub polling: bool,
+}
+
+/// 下载面板的数据。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DownloadsView {
+    pub tasks: Vec<DownloadItemView>,
+    pub download_dir: String,
+}
+
+/// 一条下载任务。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadItemView {
+    pub id: u64,
+    pub name: String,
+    pub singer: String,
+    /// 界面上的状态文案。
+    pub state: String,
+    pub active: bool,
+    pub can_retry: bool,
+    pub downloaded: u64,
+    pub total: u64,
+    /// 已耗秒数（服务线程按两次快照的增量子算速度）。
+    pub elapsed_ms: u64,
+    /// 下载速度（字节/秒），服务线程按两次快照的增量估计。
+    pub speed_bps: u64,
+    pub error: Option<String>,
+}
+
+impl DownloadItemView {
+    pub fn percent(&self) -> Option<u32> {
+        (self.total > 0).then(|| (self.downloaded.saturating_mul(100) / self.total) as u32)
+    }
 }
 
 /// 一帧的完整界面状态。
@@ -126,6 +230,9 @@ pub struct Snapshot {
     pub has_media_controls: bool,
     /// 顺序 / 播完停止模式下队列已经播到结尾（播放按钮改为从头开始）。
     pub playlist_ended: bool,
+    pub library: LibraryView,
+    pub sources: SourcesView,
+    pub downloads: DownloadsView,
 }
 
 impl Default for Snapshot {
@@ -145,6 +252,9 @@ impl Default for Snapshot {
             notification: None,
             has_media_controls: false,
             playlist_ended: false,
+            library: LibraryView::default(),
+            sources: SourcesView::default(),
+            downloads: DownloadsView::default(),
         }
     }
 }
@@ -197,19 +307,64 @@ pub enum GuiRequest {
     ///
     /// 列表与索引必须在**发起请求时**一并带上：服务线程要等前一条命令
     /// 执行完才会更新队列，等它再读「当前队列」时可能还是空的或上一次的。
-    PlayList { songs: Vec<TrackView>, index: usize },
+    PlayList {
+        songs: Vec<TrackView>,
+        index: usize,
+    },
     /// 音量（0–100）：写播放器与配置，并让 MPRIS 音量属性同步。
     SetVolume(u32),
     /// 播放模式：写配置并更新 MPRIS。
     SetPlayMode(PlayMode),
     /// 队列歌曲上移/下移一位（保持 queue_index 指向当前曲目）。
-    MoveQueue { from: usize, to: usize },
+    MoveQueue {
+        from: usize,
+        to: usize,
+    },
     /// 顺序 / 播完停止模式下队列已播完时按「播放」：从队列开头重新开始。
     RestartPlaylist,
     /// 直接播放一组曲目（MPRIS OpenUri：本地文件）。
     PlaySongs(Vec<SongInfo>),
     /// 播完停止（PlayMode::None）：播完最后一首后停在结尾。
     PlaylistEnded,
+    /// 队列拖动排序（走共享的 `ApplicationCommand::QueueMove`）。
+    ReorderQueue {
+        from: usize,
+        to: usize,
+    },
+    /// 刷新收藏 / 历史 / 歌单。
+    RefreshLibrary,
+    /// 打开一首自建歌单（读歌单内容）。
+    OpenPlaylist(String),
+    RefreshSources,
+    /// 切换默认音源（与 TUI 设置页同一语义：写配置并更新音源管理器）。
+    SetDefaultSource(String),
+    /// 启用/停用一个音源。
+    ToggleSource(String),
+    /// 开始扫码登录（重新生成二维码）。
+    StartLogin(String),
+    /// 登出。
+    LogoutSource(String),
+    /// 歌词显示开关（翻译 / 逐字）。
+    ToggleLyric(LyricToggle),
+    /// 把歌曲加入收藏 / 自建歌单。
+    ToggleFavorite(TrackView),
+    AddToPlaylist {
+        playlist: String,
+        song: TrackView,
+    },
+    /// 新建 / 删除 / 重命名自建歌单。
+    CreatePlaylist(String),
+    DeletePlaylist(String),
+    /// 从历史 / 歌单里移除一首。
+    RemoveFromHistory(TrackView),
+    RemoveFromPlaylist {
+        playlist: String,
+        song: TrackView,
+    },
+    /// 下载：入队当前曲目 / 搜索结果里的一首，取消、清理已结束。
+    DownloadSong(TrackView),
+    CancelDownload(u64),
+    ClearFinishedDownloads,
     /// 从桌面控件退出（MPRIS Quit / 窗口关闭）。
     Quit,
 }
@@ -254,6 +409,9 @@ pub trait GuiBackend: Send + Sync {
     /// 重绘回调句柄（UI 启动后装入 egui Context 的 `request_repaint`）。
     fn repaint_handle(&self) -> RepaintHandle;
 
+    /// 请求服务线程刷新长任务数据（下载进度、扫码状态）。
+    fn request_refresh(&self);
+
     /// 共享同一后端的句柄（输入线程 / 测试可以各自提交请求）。
     ///
     /// egui 的 `App` 与控制器都独占自己的 Box，外部线程必须拿到可克隆的
@@ -278,6 +436,10 @@ impl GuiBackend for AppService {
         AppService::repaint_handle(self)
     }
 
+    fn request_refresh(&self) {
+        AppService::request_refresh(self);
+    }
+
     fn clone_backend(&self) -> Box<dyn GuiBackend> {
         Box::new(self.clone())
     }
@@ -294,6 +456,23 @@ pub struct AppService {
     quit: Arc<AtomicBool>,
     /// 快照变化时调用（egui 请求重绘）；UI 启动后由控制器装入。
     wake: RepaintHandle,
+    /// 长任务（下载、扫码）的定时刷新句柄。
+    refresh: RefreshHandle,
+}
+
+/// 「立即刷新一次」的请求槽：服务线程在 select 里等待它。
+#[derive(Clone, Default)]
+pub struct RefreshHandle(Arc<tokio::sync::Notify>);
+
+impl RefreshHandle {
+    fn notify(&self) {
+        // 已经有一次待处理时不再叠加：刷新是幂等的。
+        self.0.notify_one();
+    }
+
+    async fn notified(&self) {
+        self.0.notified().await;
+    }
 }
 
 /// 可替换的重绘回调槽：服务在启动时还不知道 egui 的 Context。
@@ -335,6 +514,11 @@ impl AppService {
         self.wake.clone()
     }
 
+    /// 请求服务线程立即刷新一次长任务数据（下载进度、扫码状态）。
+    pub fn request_refresh(&self) {
+        self.refresh.notify();
+    }
+
     pub fn dispatch(&self, command: ApplicationCommand) -> Result<(), GuiError> {
         self.send(GuiRequest::Dispatch(command))
     }
@@ -362,6 +546,7 @@ impl Clone for AppService {
             snapshot: Arc::clone(&self.snapshot),
             quit: Arc::clone(&self.quit),
             wake: self.wake.clone(),
+            refresh: self.refresh.clone(),
         }
     }
 }
@@ -376,6 +561,8 @@ pub fn spawn(runtime: ApplicationRuntime, startup: Vec<GuiRequest>) -> AppServic
     let snapshot = Arc::new(SnapshotCell::default());
     let quit = Arc::new(AtomicBool::new(false));
     let wake = RepaintHandle::default();
+    let refresh = RefreshHandle::default();
+    let refresh_for_bridge = refresh.clone();
     for request in startup {
         let _ = requests_tx.send(request);
     }
@@ -384,6 +571,7 @@ pub fn spawn(runtime: ApplicationRuntime, startup: Vec<GuiRequest>) -> AppServic
         snapshot: Arc::clone(&snapshot),
         quit: Arc::clone(&quit),
         wake: wake.clone(),
+        refresh: refresh.clone(),
     };
     std::thread::Builder::new()
         .name("voicefox-gui-backend".into())
@@ -394,7 +582,14 @@ pub fn spawn(runtime: ApplicationRuntime, startup: Vec<GuiRequest>) -> AppServic
                 .thread_name("voicefox-gui-worker")
                 .build()
                 .expect("tokio runtime");
-            result.block_on(run_bridge(runtime, snapshot, quit, requests_rx, wake));
+            result.block_on(run_bridge(
+                runtime,
+                snapshot,
+                quit,
+                requests_rx,
+                wake,
+                refresh_for_bridge,
+            ));
         })
         .expect("spawn backend thread");
     service
@@ -421,6 +616,23 @@ struct Bridge {
     /// 顺序 / 播完停止模式下队列已播到末尾。
     playlist_ended: bool,
     notification: Option<String>,
+    // ── P1：歌单/收藏/历史、音源与扫码、歌词开关、下载 ──
+    /// 收藏 / 历史 / 自建歌单：直接读写 TUI 同一份存储。
+    library_store: Option<Arc<Storage>>,
+    library: LibraryView,
+    sources: Option<Arc<SourceManager>>,
+    sources_view: SourcesView,
+    /// 扫码登录的后台任务写到这个槽，界面每帧只读它。
+    login_slot: Arc<std::sync::Mutex<Option<LoginView>>>,
+    downloads: Option<Arc<DownloadManager>>,
+    downloads_view: DownloadsView,
+    /// 上一次下载快照的字节数与时间，用于估计速度。
+    download_marks: std::collections::HashMap<u64, (u64, std::time::Instant)>,
+    /// 改配置的请求（配置锁在 `ApplicationRuntime` 里，服务线程只转发）。
+    config_tx: tokio::sync::mpsc::UnboundedSender<ConfigChange>,
+    /// 当前配置（音源开关、歌词开关的判断依据，服务线程自己维护）。
+    config_snapshot: Option<Config>,
+    lyric_service: Option<Arc<lx_lyric::service::LyricService>>,
 }
 
 impl Bridge {
@@ -432,12 +644,43 @@ impl Bridge {
         self.volume = state.playback.volume;
         self.duration = state.playback.duration;
         self.current = state.playback.song.as_ref().map(TrackView::of);
-        if let Some(lyrics) = state.lyrics.as_ref() {
-            self.lyrics = LyricsView {
-                lines: lyrics.lines.iter().map(|line| line.text.clone()).collect(),
-                current: lyrics.current_line,
-            };
+        self.refresh_lyrics(Some(&state));
+    }
+
+    /// 歌词快照：行、当前行、当前行翻译、当前行逐字（YRC）。
+    ///
+    /// 歌词由核心解析后放进 `LyricState`（翻译、逐字都由核心产出），这里只
+    /// 做视图转换：翻译文本对应整份歌词的当前行译文，与 TUI 歌词面板一致。
+    fn refresh_lyrics(&mut self, state: Option<&ApplicationState>) {
+        let fallback = state.is_none().then(|| self.application.state());
+        let lyrics_state = state
+            .or(fallback.as_ref())
+            .and_then(|state| state.lyrics.as_ref());
+        let Some(lyrics) = lyrics_state else {
+            return;
+        };
+        if lyrics.is_empty || lyrics.lines.is_empty() {
+            // 没有歌词（或核心还没解析完）：保留已有的非空歌词视图，
+            // 不能用一份空视图把上一首/上一次的内容冲掉。
+            return;
         }
+        let current = lyrics
+            .current_line
+            .min(lyrics.lines.len().saturating_sub(1));
+        self.lyrics = LyricsView {
+            lines: lyrics.lines.iter().map(|line| line.text.clone()).collect(),
+            current,
+            translation: lyrics.translation.clone(),
+            words: lyrics
+                .yrc_words
+                .iter()
+                .map(|word| LyricWord {
+                    text: word.text.clone(),
+                    start_ms: word.start,
+                    duration_ms: word.duration,
+                })
+                .collect(),
+        };
     }
 
     fn handle(&mut self, event: ApplicationEvent) {
@@ -500,15 +743,7 @@ impl Bridge {
                 self.queue = queue.iter().map(TrackView::of).collect();
                 self.queue_index = index;
             }
-            ApplicationEvent::LyricsChanged { .. } => {
-                let state = self.application.state();
-                if let Some(lyrics) = state.lyrics.as_ref() {
-                    self.lyrics = LyricsView {
-                        lines: lyrics.lines.iter().map(|line| line.text.clone()).collect(),
-                        current: lyrics.current_line,
-                    };
-                }
-            }
+            ApplicationEvent::LyricsChanged { .. } => self.refresh_lyrics(None),
             ApplicationEvent::Notification { message } => self.notification = Some(message),
             _ => {}
         }
@@ -603,9 +838,393 @@ impl Bridge {
             GuiRequest::PlaylistEnded => {
                 self.notification = Some("队列已播完".into());
             }
+            GuiRequest::ReorderQueue { from, to } => {
+                // 拖动排序落到核心队列服务（与 TUI 同一条命令），索引由核心校正。
+                dispatch_detached(
+                    self.application.clone(),
+                    ApplicationCommand::QueueMove { from, to },
+                );
+                self.move_queue(from, to);
+            }
+            GuiRequest::RefreshLibrary => self.refresh_library(None),
+            GuiRequest::OpenPlaylist(id) => self.refresh_library(Some(&id)),
+            GuiRequest::RefreshSources => self.refresh_sources(),
+            GuiRequest::SetDefaultSource(source) => self.set_default_source(&source),
+            GuiRequest::ToggleSource(source) => self.toggle_source(&source),
+            GuiRequest::StartLogin(source) => self.start_login(&source),
+            GuiRequest::LogoutSource(source) => self.logout(&source),
+            GuiRequest::ToggleLyric(toggle) => self.toggle_lyric(toggle),
+            GuiRequest::ToggleFavorite(song) => self.toggle_favorite(&song),
+            GuiRequest::AddToPlaylist { playlist, song } => self.add_to_playlist(&playlist, &song),
+            GuiRequest::CreatePlaylist(name) => self.create_playlist(&name),
+            GuiRequest::DeletePlaylist(id) => self.delete_playlist(&id),
+            GuiRequest::RemoveFromHistory(song) => self.remove_history(&song),
+            GuiRequest::RemoveFromPlaylist { playlist, song } => {
+                self.remove_from_playlist(&playlist, &song);
+            }
+            GuiRequest::DownloadSong(song) => self.download_song(&song),
+            GuiRequest::CancelDownload(id) => {
+                if let Some(downloads) = self.downloads.as_ref() {
+                    downloads.cancel(id);
+                }
+                self.refresh_downloads();
+            }
+            GuiRequest::ClearFinishedDownloads => {
+                if let Some(downloads) = self.downloads.as_ref() {
+                    downloads.clear_finished();
+                }
+                self.refresh_downloads();
+            }
             GuiRequest::Quit => return true,
         }
         false
+    }
+
+    // ── 收藏 / 历史 / 歌单 ──
+
+    /// 读取收藏、历史与自建歌单；`open` 顺带读取该歌单的歌曲。
+    fn refresh_library(&mut self, open: Option<&str>) {
+        let Some(store) = self.library_store.as_ref() else {
+            return;
+        };
+        self.library.favorites = store.load_favorites().iter().map(TrackView::of).collect();
+        self.library.history = store.load_history().iter().map(TrackView::of).collect();
+        self.library.playlists = store
+            .custom_playlist_summaries()
+            .into_iter()
+            .map(|summary| PlaylistView {
+                id: summary.id,
+                name: summary.name,
+                song_count: summary.song_count,
+                songs: Vec::new(),
+            })
+            .collect();
+        match open {
+            Some(id) => {
+                let selected = store.custom_playlist(id).map(|playlist| PlaylistView {
+                    id: playlist.id,
+                    name: playlist.name,
+                    song_count: playlist.songs.len() as u32,
+                    songs: playlist.songs.iter().map(TrackView::of).collect(),
+                });
+                if let Some(playlist) = selected.as_ref()
+                    && let Some(existing) = self
+                        .library
+                        .playlists
+                        .iter_mut()
+                        .find(|item| item.id == playlist.id)
+                {
+                    existing.songs = playlist.songs.clone();
+                    existing.song_count = playlist.song_count;
+                }
+                self.library.selected = selected;
+            }
+            None => {
+                if let Some(selected) = self.library.selected.clone() {
+                    let refreshed =
+                        store
+                            .custom_playlist(&selected.id)
+                            .map(|playlist| PlaylistView {
+                                id: playlist.id,
+                                name: playlist.name,
+                                song_count: playlist.songs.len() as u32,
+                                songs: playlist.songs.iter().map(TrackView::of).collect(),
+                            });
+                    self.library.selected = refreshed;
+                }
+            }
+        }
+        self.library.error = None;
+    }
+
+    fn with_library(&mut self, action: impl FnOnce(&Storage) -> Result<(), String>) {
+        let Some(store) = self.library_store.as_ref() else {
+            return;
+        };
+        match action(store) {
+            Ok(()) => self.refresh_library(None),
+            Err(error) => self.library.error = Some(error),
+        }
+    }
+
+    fn toggle_favorite(&mut self, song: &TrackView) {
+        let song = song.to_song();
+        self.with_library(move |store| {
+            if store.is_favorite(&song) {
+                store.remove_favorite(&song);
+            } else {
+                store.add_favorite(&song);
+            }
+            Ok(())
+        });
+    }
+
+    fn add_to_playlist(&mut self, playlist: &str, song: &TrackView) {
+        let song = song.to_song();
+        let playlist = playlist.to_string();
+        self.with_library(move |store| {
+            store
+                .add_song_to_custom_playlist(&playlist, &song)
+                .map(|_| ())
+        });
+    }
+
+    fn remove_from_playlist(&mut self, playlist: &str, song: &TrackView) {
+        let song = song.to_song();
+        let playlist = playlist.to_string();
+        self.with_library(move |store| {
+            store
+                .remove_song_from_custom_playlist(&playlist, &song)
+                .map(|_| ())
+        });
+    }
+
+    fn create_playlist(&mut self, name: &str) {
+        let name = name.to_string();
+        self.with_library(move |store| store.create_custom_playlist(&name).map(|_| ()));
+    }
+
+    fn delete_playlist(&mut self, id: &str) {
+        let id = id.to_string();
+        if self
+            .library
+            .selected
+            .as_ref()
+            .is_some_and(|item| item.id == id)
+        {
+            self.library.selected = None;
+        }
+        self.with_library(move |store| store.delete_custom_playlist(&id).map(|_| ()));
+    }
+
+    fn remove_history(&mut self, song: &TrackView) {
+        let song = song.to_song();
+        self.with_library(move |store| {
+            store.remove_history(&song);
+            Ok(())
+        });
+    }
+
+    // ── 音源 / 扫码登录 ──
+
+    /// 音源列表与登录态。
+    fn refresh_sources(&mut self) {
+        let Some(sources) = self.sources.as_ref() else {
+            return;
+        };
+        let config = self.parsed_config();
+        let enabled: Vec<String> = config
+            .as_ref()
+            .map(|config| {
+                config
+                    .source
+                    .enabled
+                    .iter()
+                    .map(|source| source.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let default = config
+            .as_ref()
+            .map(|config| config.source.default.as_str().to_string())
+            .unwrap_or_default();
+        let logged_in = enabled
+            .iter()
+            .filter(|source| source_id(source).is_some_and(|id| sources.is_logged_in(id)))
+            .cloned()
+            .collect();
+        let login = self
+            .login_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.sources_view = SourcesView {
+            available: enabled.clone(),
+            enabled,
+            default,
+            logged_in,
+            login,
+            error: None,
+        };
+    }
+
+    /// 读服务线程维护的配置（改配置后由 `ConfigChange` 回填）。
+    fn parsed_config(&self) -> Option<Config> {
+        self.config_snapshot.clone()
+    }
+
+    fn set_default_source(&mut self, source: &str) {
+        self.send_config(ConfigChange::DefaultSource(source.to_string()));
+    }
+
+    fn toggle_source(&mut self, source: &str) {
+        self.send_config(ConfigChange::ToggleSource(source.to_string()));
+    }
+
+    fn logout(&mut self, source: &str) {
+        if let (Some(sources), Some(id)) = (self.sources.as_ref(), source_id(source)) {
+            match sources.logout(id) {
+                Ok(()) => {
+                    self.sources_view.logged_in.retain(|item| item != source);
+                    self.sources_view.login = None;
+                }
+                Err(error) => self.sources_view.error = Some(error),
+            }
+        }
+    }
+
+    /// 生成二维码并在后台轮询登录状态（UI 每帧只读 `sources.login`）。
+    fn start_login(&mut self, source: &str) {
+        let (Some(sources), Some(id)) = (self.sources.as_ref(), source_id(source)) else {
+            return;
+        };
+        let sources = Arc::clone(sources);
+        let slot = Arc::clone(&self.login_slot);
+        let name = source.to_string();
+        set_login(&slot, &name, None, "waiting", "正在生成二维码…", true);
+        tokio::spawn(async move {
+            let session = match sources.create_qr_login(id).await {
+                Ok(session) => session,
+                Err(error) => {
+                    set_login(
+                        &slot,
+                        &name,
+                        None,
+                        "failed",
+                        &format!("生成二维码失败: {error}"),
+                        false,
+                    );
+                    return;
+                }
+            };
+            let key = session.key.clone();
+            set_login(
+                &slot,
+                &name,
+                Some((session.url.clone(), session.image_png.clone())),
+                "waiting",
+                "请使用对应 App 扫码",
+                true,
+            );
+            let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match sources.check_qr_login(id, &key).await {
+                    Ok(result) => {
+                        let terminal = result.status.is_terminal();
+                        set_login(
+                            &slot,
+                            &name,
+                            None,
+                            &format!("{:?}", result.status).to_lowercase(),
+                            &result.message,
+                            !terminal,
+                        );
+                        if terminal {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        // 瞬时网络错误不终止轮询，二维码仍然有效。
+                        set_login(
+                            &slot,
+                            &name,
+                            None,
+                            "network_error",
+                            &format!("登录状态查询失败: {error}"),
+                            true,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // ── 歌词显示开关 ──
+
+    fn toggle_lyric(&mut self, toggle: LyricToggle) {
+        let Some(lyrics) = self.lyric_service.as_ref() else {
+            return;
+        };
+        let config = self.parsed_config();
+        match toggle {
+            LyricToggle::Translation => {
+                let enabled = config
+                    .as_ref()
+                    .is_none_or(|config| !config.lyric.show_translation);
+                lyrics.set_translation_enabled(enabled);
+                self.send_config(ConfigChange::LyricTranslation(enabled));
+            }
+            LyricToggle::Yrc => {
+                let enabled = config.as_ref().is_none_or(|config| !config.lyric.show_yrc);
+                lyrics.set_yrc_enabled(enabled);
+                self.send_config(ConfigChange::LyricYrc(enabled));
+            }
+        }
+    }
+
+    // ── 下载 ──
+
+    fn download_song(&mut self, song: &TrackView) {
+        let (Some(downloads), Some(sources)) = (self.downloads.as_ref(), self.sources.as_ref())
+        else {
+            return;
+        };
+        let (notify, _notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        downloads.enqueue(song.to_song(), Arc::clone(sources), notify);
+        self.refresh_downloads();
+    }
+
+    /// 下载面板：状态 + 本次轮询间的速度估计。
+    fn refresh_downloads(&mut self) {
+        let Some(downloads) = self.downloads.as_ref() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut next = DownloadsView {
+            tasks: Vec::new(),
+            download_dir: downloads.download_dir().display().to_string(),
+        };
+        let mut marks = std::collections::HashMap::new();
+        for task in downloads.snapshot() {
+            let downloaded = task.progress.downloaded.max(task.bytes);
+            let speed = match self.download_marks.get(&task.id) {
+                Some((previous_bytes, previous_at))
+                    if downloaded > *previous_bytes && !previous_at.elapsed().is_zero() =>
+                {
+                    ((downloaded - previous_bytes) as f64 / previous_at.elapsed().as_secs_f64())
+                        as u64
+                }
+                _ => 0,
+            };
+            if task.state.is_active() {
+                marks.insert(task.id, (downloaded, now));
+            }
+            next.tasks.push(DownloadItemView {
+                id: task.id,
+                name: task.name.clone(),
+                singer: task.singer.clone(),
+                state: download_state_label(task.state).to_string(),
+                active: task.state.is_active(),
+                can_retry: matches!(
+                    task.state,
+                    voicefox_runtime::download::DownloadState::Failed
+                        | voicefox_runtime::download::DownloadState::Cancelled
+                ),
+                downloaded,
+                total: task.progress.total.max(task.expected_size.unwrap_or(0)),
+                elapsed_ms: task.elapsed.as_millis() as u64,
+                speed_bps: speed,
+                error: task.error.clone(),
+            });
+        }
+        self.download_marks = marks;
+        self.downloads_view = next;
+    }
+
+    fn send_config(&mut self, change: ConfigChange) {
+        let _ = self.config_tx.send(change);
     }
 
     /// 播放整张列表并从 `index` 开始。
@@ -672,6 +1291,9 @@ impl Bridge {
             notification: self.notification.clone(),
             has_media_controls,
             playlist_ended: self.playlist_ended,
+            library: self.library.clone(),
+            sources: self.sources_view.clone(),
+            downloads: self.downloads_view.clone(),
         }
     }
 
@@ -818,9 +1440,11 @@ async fn run_bridge(
     runtime: ApplicationRuntime,
     snapshot: Arc<SnapshotCell>,
     quit: Arc<AtomicBool>,
-    mut requests: mpsc::UnboundedReceiver<GuiRequest>,
+    requests: mpsc::UnboundedReceiver<GuiRequest>,
     wake: RepaintHandle,
+    refresh: RefreshHandle,
 ) {
+    let (config_tx, mut config_rx) = mpsc::unbounded_channel::<ConfigChange>();
     let mode = {
         let session = runtime.media();
         let guard = session.lock().unwrap_or_else(|e| e.into_inner());
@@ -830,6 +1454,9 @@ async fn run_bridge(
     let has_media_controls = runtime.start_media_controls().await;
     let media = runtime.media();
     let player = Arc::clone(&runtime.player);
+    // 下载管理器要绑定 runtime 句柄：在服务线程自己的 runtime 里构造。
+    let downloads = runtime.build_downloads(tokio::runtime::Handle::current());
+    let config_snapshot = runtime.config_snapshot();
     let mut bridge = Bridge {
         application: application.clone(),
         media: Arc::clone(&media),
@@ -847,8 +1474,22 @@ async fn run_bridge(
         current: None,
         playlist_ended: false,
         notification: None,
+        library_store: Some(Arc::clone(&runtime.storage)),
+        library: LibraryView::default(),
+        sources: Some(runtime.sources()),
+        sources_view: SourcesView::default(),
+        login_slot: Arc::new(std::sync::Mutex::new(None)),
+        downloads: Some(downloads),
+        downloads_view: DownloadsView::default(),
+        download_marks: std::collections::HashMap::new(),
+        config_tx,
+        config_snapshot: Some(config_snapshot),
+        lyric_service: Some(runtime.lyrics()),
     };
     bridge.refresh_from_application();
+    bridge.refresh_library(None);
+    bridge.refresh_sources();
+    bridge.refresh_downloads();
 
     let mut events = application.subscribe();
     let mut player_state = player.state_watcher();
@@ -861,8 +1502,26 @@ async fn run_bridge(
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut requests = requests;
     loop {
         tokio::select! {
+            Some(change) = config_rx.recv() => {
+                match apply_config_change(&runtime, &change) {
+                    Ok(message) => {
+                        bridge.notification = Some(message);
+                        bridge.config_snapshot = Some(runtime.config_snapshot());
+                        bridge.refresh_sources();
+                    }
+                    Err(error) => bridge.notification = Some(error),
+                }
+                force_publish = true;
+            }
+            _ = refresh.notified() => {
+                // 下载进度与扫码状态：定时刷新，界面只读快照。
+                bridge.refresh_downloads();
+                bridge.refresh_sources();
+                force_publish = true;
+            }
             Some(request) = requests.recv() => {
                 if bridge.apply(request) {
                     quit.store(true, Ordering::Release);
@@ -1094,6 +1753,114 @@ mod tests {
         assert_eq!(search.keyword, "a");
     }
 }
+
+/// 改配置的请求：配置锁在 `ApplicationRuntime` 里，界面只发一句描述。
+///
+/// 服务线程把它转成真正的 `Config` 修改后交给 runtime：内存与 `config.toml`
+/// 一起更新（与 TUI 设置页同一条落盘路径），音源管理器同步新偏好。
+#[derive(Debug, Clone)]
+pub enum ConfigChange {
+    DefaultSource(String),
+    ToggleSource(String),
+    LyricTranslation(bool),
+    LyricYrc(bool),
+}
+
+/// 把 `ConfigChange` 应用到运行时配置：返回给用户看的说明。
+pub fn apply_config_change(
+    runtime: &ApplicationRuntime,
+    change: &ConfigChange,
+) -> Result<String, String> {
+    let mut message = String::new();
+    runtime.update_config(|config| match change {
+        ConfigChange::DefaultSource(source) => {
+            if let Some(id) = source_id(source) {
+                config.source.default = id;
+                message = format!("默认音源: {}", id.as_str());
+            }
+        }
+        ConfigChange::ToggleSource(source) => {
+            if let Some(id) = source_id(source) {
+                if let Some(position) = config.source.enabled.iter().position(|item| *item == id) {
+                    if config.source.enabled.len() > 1 {
+                        config.source.enabled.remove(position);
+                        message = format!("已停用音源: {}", id.as_str());
+                    }
+                } else {
+                    config.source.enabled.push(id);
+                    message = format!("已启用音源: {}", id.as_str());
+                }
+            }
+        }
+        ConfigChange::LyricTranslation(enabled) => {
+            config.lyric.show_translation = *enabled;
+            message = format!("歌词翻译: {}", if *enabled { "开" } else { "关" });
+        }
+        ConfigChange::LyricYrc(enabled) => {
+            config.lyric.show_yrc = *enabled;
+            message = format!("逐字歌词: {}", if *enabled { "开" } else { "关" });
+        }
+    })?;
+    runtime.apply_source_preferences();
+    Ok(message)
+}
+
+/// 音源配置文本里的名字 → [`SourceId`]（只接受内置在线音源）。
+fn source_id(value: &str) -> Option<SourceId> {
+    SourceId::all_online()
+        .iter()
+        .copied()
+        .find(|source| source.as_str().eq_ignore_ascii_case(value.trim()))
+}
+
+/// 扫码登录槽的写入（后台任务与界面之间只传这一份视图）。
+///
+/// `qr` 只在「刚生成二维码」时给出；之后的轮询只更新状态文字，二维码保持不清空
+/// （状态变化不能把码擦掉，用户可能在扫码中途看到状态更新）。
+pub fn set_login(
+    slot: &std::sync::Mutex<Option<LoginView>>,
+    source: &str,
+    qr: Option<(String, Option<String>)>,
+    status: &str,
+    message: &str,
+    polling: bool,
+) {
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let previous = guard.take();
+    let qr = qr.or_else(|| {
+        previous
+            .as_ref()
+            .map(|previous| (previous.url.clone(), previous.image_base64.clone()))
+    });
+    let (url, image_base64) = qr.unwrap_or_default();
+    *guard = Some(LoginView {
+        source: source.to_string(),
+        url,
+        image_base64,
+        status: status.to_string(),
+        message: message.to_string(),
+        polling,
+    });
+}
+
+/// 下载状态的界面文案。
+fn download_state_label(state: voicefox_runtime::download::DownloadState) -> &'static str {
+    use voicefox_runtime::download::DownloadState;
+    match state {
+        DownloadState::Queued => "排队中",
+        DownloadState::Resolving => "解析中",
+        DownloadState::Downloading => "下载中",
+        DownloadState::Tagging => "写入标签",
+        DownloadState::Done => "已完成",
+        DownloadState::Skipped => "已跳过",
+        DownloadState::Cancelled => "已取消",
+        DownloadState::Failed => "失败",
+    }
+}
+
 /// 当前曲目自然播完后该做什么（按播放模式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NextTarget {

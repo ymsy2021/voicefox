@@ -186,6 +186,7 @@ impl eframe::App for VoicefoxGuiApp {
             return;
         };
         controller.apply_snapshot(snapshot);
+        controller.tick_refresh();
         self.ui
             .show(ui, controller, self.theme, &self.cover_results);
 

@@ -4,6 +4,7 @@
 //! 不做 IO，也不阻塞。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -54,6 +55,8 @@ pub struct VoicefoxGuiController {
     status: Option<String>,
     /// 上一条已经展示过的通知（避免同一通知每秒重刷状态栏）。
     seen_notification: Option<String>,
+    /// 上次请求服务线程刷新长任务数据的时间。
+    last_refresh: Instant,
 }
 
 impl VoicefoxGuiController {
@@ -77,6 +80,7 @@ impl VoicefoxGuiController {
             synced_keyword: search_input,
             status: None,
             seen_notification: None,
+            last_refresh: Instant::now(),
         }
     }
 
@@ -86,6 +90,14 @@ impl VoicefoxGuiController {
 
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// 每 500ms 请服务线程刷新一次下载进度与扫码状态（界面自己不轮询后端）。
+    pub fn tick_refresh(&mut self) {
+        if self.last_refresh.elapsed() >= Duration::from_millis(500) {
+            self.last_refresh = Instant::now();
+            self.backend.request_refresh();
+        }
     }
 
     /// 用服务线程发布的最新快照刷新界面状态。
