@@ -56,6 +56,7 @@ pub async fn resolve_cover_url(
     resolved
 }
 
+/// 播放器事件的订阅入口（runtime 把它接进服务层）。
 #[derive(Clone)]
 pub struct PlaybackService {
     player: Arc<dyn PlayerBackend>,
@@ -80,6 +81,7 @@ impl PlaybackService {
         }
     }
 
+    /// 播放器后端句柄（runtime 用它订阅生命周期事件、读取进度）。
     pub fn player(&self) -> Arc<dyn PlayerBackend> {
         Arc::clone(&self.player)
     }

@@ -1,3 +1,3 @@
 pub mod manager;
-pub mod mode;
+pub use voicefox_runtime::media::mode;
 pub mod shuffle;

@@ -10,7 +10,9 @@ use std::sync::{Arc, RwLock};
 use voicefox_application::{ApplicationService, PlaybackEffects};
 
 mod cover;
+pub mod media;
 pub mod storage;
+pub mod ui;
 pub use cover::{CoverService, CoverState, is_usable_remote_url, sweep_temp_files};
 pub use storage::{SavedPlayerState, Storage};
 pub use voicefox_application::resolve_cover_url;
@@ -107,6 +109,8 @@ impl PlaybackEffects for RuntimePlaybackEffects {
 
 pub struct ApplicationRuntime {
     application: ApplicationService,
+    media: Arc<std::sync::Mutex<media::MediaSession>>,
+    #[allow(dead_code)]
     pub config: Arc<RwLock<Config>>,
     pub config_path: PathBuf,
     pub storage: Arc<Storage>,
@@ -153,9 +157,18 @@ impl ApplicationRuntime {
             Arc::clone(&lyrics),
             effects,
         );
+        let mode = media::PlayMode::from_config(
+            &shared
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .player
+                .play_mode,
+        );
+        let media = media::MediaSession::new(application.clone(), mode, None, None);
         Ok(Self {
             application,
             config: shared,
+            media: Arc::new(std::sync::Mutex::new(media)),
             config_path,
             storage,
             cover,
@@ -172,9 +185,33 @@ impl ApplicationRuntime {
     pub fn application(&self) -> ApplicationService {
         self.application.clone()
     }
+    /// 共享的媒体会话：媒体键快照与命令的唯一接入点。
+    pub fn media(&self) -> Arc<std::sync::Mutex<media::MediaSession>> {
+        Arc::clone(&self.media)
+    }
+    /// 启动平台媒体控件后端（MPRIS）。配置关闭或平台不支持时返回 `false`，
+    /// 播放本身不受影响。
+    pub async fn start_media_controls(&self) -> bool {
+        let enabled = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .integration
+            .mpris;
+        let (handle, commands) = media::start_media_controls(enabled).await;
+        let mut session = self.media.lock().unwrap_or_else(|e| e.into_inner());
+        let started = handle.is_some();
+        session.attach(handle, commands);
+        started
+    }
     pub fn state(&self) -> voicefox_application::ApplicationState {
         self.application.state()
     }
+    /// 取当前歌曲封面并返回本地缓存路径；失败返回 `None`（界面显示占位图）。
+    pub async fn load_cover(&self, url: Option<String>) -> Option<String> {
+        self.cover.cache_path(url).await.ok().flatten()
+    }
+
     pub fn player_state(&self) -> PlayerState {
         *self.player.state_watcher().borrow()
     }

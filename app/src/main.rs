@@ -12,18 +12,11 @@ mod fmt;
 mod instance_lock;
 mod listenbrainz;
 mod media_controls;
-mod media_session;
-#[cfg(target_os = "linux")]
-mod mpris;
 mod notification;
-#[cfg(target_os = "macos")]
-mod nowplaying;
 mod pages;
 mod playlist;
 mod remote_cache;
 mod sleep_timer;
-#[cfg(target_os = "windows")]
-mod smtc;
 mod storage;
 mod sync;
 mod ui_cursor;
@@ -35,6 +28,9 @@ mod tmux;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use media_controls::{current_media_snapshot, execute_media_command, start_media_controls};
 use media_controls::{persist_volume, toggle_or_start_current};
+
+/// 媒体会话（MPRIS 快照 / 媒体键）与 TUI、GUI 共用 `voicefox-runtime` 的实现。
+use voicefox_runtime::media as lk_media;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1787,7 +1783,7 @@ fn run_app(
     // 媒体控件状态：三个平台（Linux MPRIS / Windows SMTC / macOS Now Playing）
     // 共用同一套快照节流变量，声明与使用点的 cfg 必须完全一致。
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let mut last_media_snapshot: Option<media_session::MediaSnapshot> = None;
+    let mut last_media_snapshot: Option<lk_media::MediaSnapshot> = None;
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut last_media_update = Instant::now() - Duration::from_secs(1);
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -2750,7 +2746,7 @@ fn run_app(
         // macOS Now Playing 的回调投递在主队列，主线程只能在这里顺手处理。
         #[cfg(target_os = "macos")]
         if media_handle.is_some() {
-            nowplaying::pump_main_run_loop();
+            lk_media::nowplaying::pump_main_run_loop();
         }
 
         // === 2. 事件驱动：轮询终端事件 ===

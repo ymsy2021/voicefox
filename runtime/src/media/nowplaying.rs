@@ -22,17 +22,14 @@ use souvlaki::{MediaControls, MediaMetadata, MediaPlayback, MediaPosition, Platf
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::warn;
 
-use crate::media_session::{MediaCommand, MediaSnapshot};
+use crate::media::{MediaCommand, MediaSnapshot, translate_event};
 
 /// 快照轮询间隔：与 SMTC 同口径，决定媒体键事件的响应延迟与空转开销的平衡。
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
-pub fn start() -> anyhow::Result<(
-    crate::media_session::MediaHandle,
-    UnboundedReceiver<MediaCommand>,
-)> {
+pub fn start() -> anyhow::Result<(crate::media::MediaHandle, UnboundedReceiver<MediaCommand>)> {
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (handle, update_rx) = crate::media_session::channel();
+    let (handle, update_rx) = crate::media::channel();
 
     // 控件与创建它的线程绑定，线程退出即控件失效，因此存活到进程结束；
     // 失败只记日志由用户在通知里看到。
@@ -59,7 +56,7 @@ fn run_worker(
     .map_err(|error| anyhow::anyhow!("create media controls: {error}"))?;
     controls
         .attach(move |event| {
-            if let Some(command) = crate::media_session::translate_event(event) {
+            if let Some(command) = translate_event(event) {
                 let _ = command_tx.send(command);
             }
         })
