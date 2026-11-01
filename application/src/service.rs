@@ -185,6 +185,12 @@ impl ApplicationService {
                 self.publish_queue();
                 Ok(())
             }
+            ApplicationCommand::QueueMove { from, to } => {
+                if self.queue.move_song(from, to).is_some() {
+                    self.publish_queue();
+                }
+                Ok(())
+            }
             ApplicationCommand::Next => {
                 let (songs, index) = self.queue.snapshot();
                 if songs.is_empty() {

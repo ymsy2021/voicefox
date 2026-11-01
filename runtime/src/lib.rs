@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use voicefox_application::{ApplicationService, PlaybackEffects};
 
 mod cover;
+pub mod download;
 pub mod media;
 pub mod storage;
 pub mod ui;
@@ -207,6 +208,53 @@ impl ApplicationRuntime {
     pub fn state(&self) -> voicefox_application::ApplicationState {
         self.application.state()
     }
+    /// 共享的下载管理器（与 TUI 同一份实现：并发分片、记录、自动缓存）。
+    ///
+    /// 需要在 tokio runtime 内构造（绑定 runtime 句柄）。
+    pub fn build_downloads(&self, rt: tokio::runtime::Handle) -> Arc<download::DownloadManager> {
+        Arc::new(download::DownloadManager::new(
+            &self.config.read().unwrap_or_else(|e| e.into_inner()),
+            rt,
+        ))
+    }
+
+    /// 配置里的音源偏好变化后同步给音源管理器（与 TUI 设置页同一调用）。
+    pub fn apply_source_preferences(&self) {
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner());
+        self.sources
+            .update_source_preferences(config.source.default, &config.source.enabled);
+    }
+
+    /// 音源管理器（扫码登录、登录态、偏好）。
+    pub fn sources(&self) -> Arc<SourceManager> {
+        Arc::clone(&self.sources)
+    }
+
+    /// 歌词服务（翻译开关、偏移）。
+    pub fn lyrics(&self) -> Arc<LyricService> {
+        Arc::clone(&self.lyrics)
+    }
+
+    /// 播放器后端（队列重排等播放器侧操作）。
+    pub fn player(&self) -> Arc<dyn PlayerBackend> {
+        Arc::clone(&self.player)
+    }
+
+    /// 读配置副本（界面只读快照用）。
+    pub fn config_snapshot(&self) -> Config {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 改配置并落盘：与 TUI 设置页同一条路径（改内存 + 原子写 config.toml）。
+    pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<(), String> {
+        let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
+        change(&mut config);
+        crate::storage::save_config(&config, &self.config_path)
+    }
+
     /// 取当前歌曲封面并返回本地缓存路径；失败返回 `None`（界面显示占位图）。
     pub async fn load_cover(&self, url: Option<String>) -> Option<String> {
         self.cover.cache_path(url).await.ok().flatten()

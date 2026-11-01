@@ -1189,6 +1189,18 @@ impl Storage {
     }
 }
 
+/// 原子地把配置写到磁盘（与 TUI 设置页、音量保存同一条路径）。
+///
+/// 放在 runtime 里，桌面 GUI 与 TUI 共用同一份落盘语义（临时文件 + rename）。
+pub fn save_config(
+    config: &lx_core::model::config::Config,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let text =
+        toml::to_string_pretty(config).map_err(|error| format!("序列化配置失败: {error}"))?;
+    save_atomic(path, text.as_bytes())
+}
+
 pub fn save_atomic(path: &std::path::Path, content: &[u8]) -> Result<(), String> {
     save_atomic_impl(path, content, true)
 }
