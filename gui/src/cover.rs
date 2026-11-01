@@ -70,6 +70,15 @@ impl CoverCache {
     /// 每帧调用：新的加载结果转成纹理，并为已知 URL 确保加载已排队。
     pub fn sync(&mut self, ctx: &Context, results: &CoverResults, wanted: &[String]) -> bool {
         let mut changed = self.drain(ctx, results);
+        // `drain` 每帧只处理有限几张；若队列里还有积压，必须请求下一帧，
+        // 否则界面空闲下来后剩下的封面永远排不空。
+        let backlog = results
+            .lock()
+            .map(|guard| !guard.is_empty())
+            .unwrap_or(false);
+        if backlog {
+            ctx.request_repaint();
+        }
         for url in wanted {
             if !url.is_empty()
                 && !self.entries.contains_key(url)
@@ -83,18 +92,33 @@ impl CoverCache {
         changed
     }
 
+    /// 每帧最多把几张解码结果转成纹理。
+    ///
+    /// 一次搜索可能返回上百条结果，解码后的封面会在同一瞬间涌入队列。
+    /// 若在一个 UI 帧里全部 `downscale` + 转 `ColorImage` + 上传 GPU
+    /// （190 张 500×500 就是 ~181MB），这一帧会卡住好几秒，表现为
+    /// 「搜索完界面短暂无响应」。分摊到多帧后每帧只做一点点，界面始终可交互。
+    const TEXTURES_PER_FRAME: usize = 2;
+
     /// 把服务线程的结果放进纹理缓存；返回是否新增了纹理。
     pub fn drain(&mut self, ctx: &Context, results: &CoverResults) -> bool {
+        // 只取有限条，剩下的留在队列里下一帧继续处理。
         let drained: Vec<_> = match results.lock() {
-            Ok(mut guard) => guard.drain(..).collect(),
+            Ok(mut guard) => {
+                let take = guard.len().min(Self::TEXTURES_PER_FRAME);
+                guard.drain(..take).collect()
+            }
             Err(_) => Vec::new(),
         };
         let mut changed = false;
         for (url, rgba) in drained {
             self.pending.remove(&url);
+            // 缩放已在解码线程里做完（见 `decode`），这里只做廉价的颜色转换
+            // 与纹理上传。以前 `downscale` 在这里跑：一张 1200² 封面用
+            // Triangle 滤波要约 530ms，190 张就会把 UI 线程锁死好几秒，
+            // 表现为「搜索完界面短暂无响应」。
             let image = match rgba {
                 Some(buffer) => {
-                    let buffer = downscale(buffer);
                     let size = [buffer.width() as usize, buffer.height() as usize];
                     let pixels = buffer.into_raw();
                     let color_image =
@@ -190,13 +214,17 @@ impl CoverLoader for RuntimeCoverLoader {
         let sink = Arc::clone(&self.sink);
         let controller = self.controller.clone();
         (self.request)(url.clone());
+        // 共享一个解码 runtime。
+        //
+        // 以前这里对**每张封面**调用 `Builder::new_current_thread().build()`，
+        // 也就是每个 URL 都新建一套 epoll / timer / IO driver 线程。搜索结果
+        // 动辄上百条时，瞬间创建上百个 runtime 和数百个线程，CPU 全耗在建/销毁
+        // runtime 上，UI 线程连一帧都跑不完 —— 表现为「搜完就卡住」。
+        //
+        // 并发上限交给 tokio 的阻塞池（默认 512，远大于同时在途的封面数），
+        // 关键是**不再重复创建 runtime**。
         tokio::task::spawn_blocking(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let decoded = runtime
-                .ok()
-                .and_then(|runtime| runtime.block_on(decode(&service, &url)));
+            let decoded = decode_runtime().block_on(decode(&service, &url));
             if let Ok(mut guard) = sink.lock() {
                 guard.push((url, decoded));
             }
@@ -207,6 +235,19 @@ impl CoverLoader for RuntimeCoverLoader {
     }
 }
 
+/// 共享的解码 runtime（只在首次使用时创建一次）。
+fn decode_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("voicefox-gui-cover-decode")
+            .build()
+            .expect("cover decode runtime")
+    })
+}
+
 async fn decode(service: &CoverService, url: &str) -> Option<image::RgbaImage> {
     let path = service
         .cache_path(Some(url.to_string()))
@@ -214,12 +255,15 @@ async fn decode(service: &CoverService, url: &str) -> Option<image::RgbaImage> {
         .ok()
         .flatten()?;
     let bytes = std::fs::read(path).ok()?;
-    image::load_from_memory(&bytes)
-        .ok()
-        .map(|image| image.to_rgba8())
+    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    // 缩放在解码线程里做（它是 CPU 重活，不能留在 UI 线程）。
+    Some(downscale(image))
 }
 
 /// 把任意尺寸封面缩到 GPU 友好的大小（等比）。
+///
+/// 这是纯 CPU 的活，只应在解码线程里调用（见 [`decode`]），不要放到 UI
+/// 线程上：1200² → 512² 用 Triangle 滤波单张就要 ~530ms。
 pub fn downscale(buffer: image::RgbaImage) -> image::RgbaImage {
     if buffer.width() <= MAX_COVER_SIDE && buffer.height() <= MAX_COVER_SIDE {
         return buffer;
