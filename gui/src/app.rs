@@ -106,36 +106,19 @@ struct VoicefoxGuiApp {
 
 /// 中文字体：egui 自带字体没有 CJK 字形，不装这个界面会全是方框。
 ///
-/// 字体与 libmpv 同属原生依赖，不随仓库分发；构建前把 Noto Sans CJK 放到
-/// `gui/assets/NotoSansCJK-Regular.ttc`（`scripts/fetch-gui-assets.sh` 会做这件事）。
-/// 运行期也可以用 `VOICEFOX_GUI_FONT` 指向任意 `.ttc`/`.ttf`。
+/// 字体与 libmpv 同属原生依赖，不随仓库分发：构建时把 Noto Sans CJK
+/// （SIL OFL 1.1）放在 `gui/assets/NotoSansCJK-Regular.ttc`，由
+/// `scripts/fetch-gui-assets.sh` 准备（CI 与本地构建都会先跑它）。
 const CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansCJK-Regular.ttc");
 
-/// 字体加载失败时给用户的一句话。
-pub const MISSING_FONT_HINT: &str = "未安装中文字体：请运行 scripts/fetch-gui-assets.sh，\
-或用 VOICEFOX_GUI_FONT 指向一个 .ttc/.ttf，或在系统里安装 Noto Sans CJK";
-
-/// 中文字体数据：优先 `VOICEFOX_GUI_FONT`，否则用构建时嵌入的那份。
-fn cjk_font_data() -> std::sync::Arc<egui::FontData> {
-    if let Ok(path) = std::env::var("VOICEFOX_GUI_FONT")
-        && let Ok(bytes) = std::fs::read(&path)
-    {
-        return std::sync::Arc::new(egui::FontData::from_owned(bytes));
-    }
-    std::sync::Arc::new(egui::FontData::from_static(CJK_FONT))
-}
-
-/// 把中文字体接到比例与等宽字体的末尾（拉丁字母仍用 egui 默认字体）。
-///
-/// 返回 `false` 表示没有可用的中文字体，调用方应提示用户。
-fn install_fonts(ctx: &egui::Context) -> bool {
+/// 把中文字体接到比例与等宽字体的末尾：拉丁字母与图标仍用 egui 默认字体，
+/// 缺字时才回落到中文字体。
+fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    if std::env::var("VOICEFOX_GUI_FONT").is_ok_and(|path| !std::path::Path::new(&path).is_file()) {
-        eprintln!("{MISSING_FONT_HINT}");
-        ctx.set_fonts(fonts);
-        return false;
-    }
-    fonts.font_data.insert("cjk".to_owned(), cjk_font_data());
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(CJK_FONT)),
+    );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
             .families
@@ -144,12 +127,11 @@ fn install_fonts(ctx: &egui::Context) -> bool {
             .push("cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-    true
 }
 
 /// 装好中文字体（测试与演示程序用；生产路径在 [`VoicefoxGuiApp::startup`]）。
 pub fn install_cjk_font(ctx: &egui::Context) {
-    let _ = install_fonts(ctx);
+    install_fonts(ctx);
 }
 
 impl VoicefoxGuiApp {
@@ -158,9 +140,7 @@ impl VoicefoxGuiApp {
         cc: &eframe::CreationContext<'_>,
         cover_runtime: Option<tokio::runtime::Runtime>,
     ) -> Self {
-        if !install_fonts(&cc.egui_ctx) {
-            eprintln!("{MISSING_FONT_HINT}");
-        }
+        install_fonts(&cc.egui_ctx);
         let loader = Arc::new(RuntimeCoverLoader::new(
             Arc::clone(&self.cover_service),
             cc.egui_ctx.clone(),

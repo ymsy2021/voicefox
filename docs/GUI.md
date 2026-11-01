@@ -12,8 +12,8 @@ cargo run -p voicefox-gui --bin voicefox-gui-demo   # 假后端演示，不需�
 ```
 
 字体：egui 自带字体没有 CJK 字形，构建时把 Noto Sans CJK（SIL OFL 1.1）嵌进二进制。
-`scripts/fetch-gui-assets.sh` 优先软链系统里已有的一份，没有再下载。运行期可以用
-`VOICEFOX_GUI_FONT=/path/to/font.ttc` 覆盖。
+`scripts/fetch-gui-assets.sh` 优先软链系统里已有的一份，没有再下载；与 libmpv 一样，
+字体不随仓库分发。缺了这一步 `cargo build -p voicefox-gui` 会直接报错，不会悄悄产出方块界面。
 
 首次启动读取 `~/.config/voicefox/config.toml`（与 TUI 同一份配置）。没有配置文件时
 按默认配置运行；配置里的音量、音质、播放模式、主题（`[theme]`）都会被 GUI 采用。
@@ -93,9 +93,10 @@ VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard 
 把窗口写一张 PNG（`latest.png` 为最新）。另有两个调试用环境变量：
 
 - `VOICEFOX_GUI_AUTOSEARCH=<关键词>`：窗口打开后立即搜索；
-- `VOICEFOX_GUI_INPUT=<文件>`：逐行读取命令，`search:<词>` / `play:<序号>` / `toggle` /
-  `next` / `previous` / `quit`，用于没有键盘注入工具的环境；
-- `VOICEFOX_GUI_LOG=<文件>`：命令与派发诊断日志。
+- `VOICEFOX_GUI_INPUT=<文件>`：逐行读取命令，`search:<词>` / `play:<序号>`（序号按当前
+  搜索结果，从 1 开始）/ `toggle` / `next` / `previous` / `quit`，用于没有键盘注入工具的
+  环境；
+- `VOICEFOX_GUI_LOG=<文件>`：输入线程与派发失败的诊断日志。
 
 这些只用于本地验收，不影响正常使用。
 
