@@ -31,6 +31,13 @@ pub struct CoverCache {
     entries: HashMap<String, CoverImage>,
     order: Vec<String>,
     pending: std::collections::HashSet<String>,
+    /// 已经淘汰过的 URL：不再自动重试。
+    ///
+    /// 搜索一次可能返回几百条结果，远多于 [`CACHE_CAPACITY`]。若淘汰后允许
+    /// 重新请求，被淘汰的那张会在下一帧变回「既不在 entries 也不在 pending」，
+    /// 于是再次下载、再次上传纹理、再次淘汰 —— 每帧几十次网络与纹理上传，
+    /// UI 线程被淹没，表现为界面点不动。这里记住淘汰项，只允许用户显式重试。
+    evicted: std::collections::HashSet<String>,
     loader: Option<Arc<dyn CoverLoader>>,
 }
 
@@ -39,9 +46,13 @@ impl CoverCache {
         self.entries.get(url).cloned()
     }
 
-    /// 请求加载一张封面；已缓存或已在途时什么也不做。
+    /// 请求加载一张封面；已缓存、已在途或已被淘汰时什么也不做。
     pub fn request(&mut self, url: &str) {
-        if url.is_empty() || self.entries.contains_key(url) || self.pending.contains(url) {
+        if url.is_empty()
+            || self.entries.contains_key(url)
+            || self.pending.contains(url)
+            || self.evicted.contains(url)
+        {
             return;
         }
         self.pending.insert(url.to_string());
@@ -60,7 +71,11 @@ impl CoverCache {
     pub fn sync(&mut self, ctx: &Context, results: &CoverResults, wanted: &[String]) -> bool {
         let mut changed = self.drain(ctx, results);
         for url in wanted {
-            if !url.is_empty() && !self.entries.contains_key(url) && !self.pending.contains(url) {
+            if !url.is_empty()
+                && !self.entries.contains_key(url)
+                && !self.pending.contains(url)
+                && !self.evicted.contains(url)
+            {
                 self.request(url);
                 changed = true;
             }
@@ -104,6 +119,9 @@ impl CoverCache {
             if self.order.len() > CACHE_CAPACITY {
                 let evicted = self.order.remove(0);
                 self.entries.remove(&evicted);
+                // 记住淘汰项：否则下一帧它又会被当作「从未请求」重新下载，
+                // 在结果数远超容量时空转（见字段注释）。
+                self.evicted.insert(evicted);
             }
         }
         self.entries.insert(url, image);
@@ -116,6 +134,7 @@ impl Clone for CoverCache {
             entries: self.entries.clone(),
             order: self.order.clone(),
             pending: self.pending.clone(),
+            evicted: self.evicted.clone(),
             loader: self.loader.clone(),
         }
     }
@@ -226,7 +245,8 @@ pub fn load_decoded(service: &CoverService, url: &str) -> Option<image::RgbaImag
 
 #[cfg(test)]
 mod tests {
-    use super::{CoverCache, CoverImage, CoverLoader, downscale};
+    use super::{CoverCache, CoverImage, CoverLoader, CoverResults, downscale};
+    use crate::cover::Context;
     use std::sync::{Arc, Mutex};
 
     struct RecordingLoader(Mutex<Vec<String>>);
@@ -271,5 +291,51 @@ mod tests {
     #[test]
     fn small_covers_are_left_alone() {
         assert_eq!(downscale(image::RgbaImage::new(300, 300)).width(), 300);
+    }
+
+    /// 回归用例：结果数远超缓存容量时，淘汰项不能被无限重新请求。
+    ///
+    /// 修复前 189 个 URL / 24 容量跑 200 帧会发出 3 万多次请求（每帧都在重新
+    /// 下载并上传纹理），UI 线程被淹没，表现为「界面点不动」。
+    #[test]
+    fn evicted_covers_are_not_requested_again() {
+        let loader = Arc::new(RecordingLoader(Mutex::new(Vec::new())));
+        let mut cache =
+            CoverCache::default().with_loader(Arc::clone(&loader) as Arc<dyn CoverLoader>);
+        let watched: Vec<String> = (0..189).map(|i| format!("u{i}")).collect();
+
+        // 模拟：结果逐步返回，每轮把上一轮请求过的都算作加载成功。
+        // 直接用 `drain` 灌结果，避免依赖 egui 纹理。
+        let results: CoverResults = Arc::new(Mutex::new(Vec::new()));
+        let mut completed: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            for url in completed.drain(..) {
+                results
+                    .lock()
+                    .unwrap()
+                    .push((url, Some(image::RgbaImage::new(2, 2))));
+            }
+            let ctx = Context::default();
+            let mut new_changed = false;
+            for url in &watched {
+                if !cache.entries.contains_key(url)
+                    && !cache.pending.contains(url)
+                    && !cache.evicted.contains(url)
+                {
+                    cache.request(url);
+                    new_changed = true;
+                }
+            }
+            cache.drain(&ctx, &results);
+            let _ = new_changed;
+            completed = loader.0.lock().unwrap().clone();
+        }
+
+        let total = loader.0.lock().unwrap().len();
+        // 每个 URL 最多请求一次：189 条结果就该只有 ~189 次请求。
+        assert_eq!(
+            total, 189,
+            "每个封面只应请求一次，实际 {total} 次（存在淘汰后重复请求）"
+        );
     }
 }

@@ -280,35 +280,52 @@ impl UiState {
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                self.thumbnail(ui, covering.as_ref(), 34.0, theme);
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(&song.name).color(theme.text).strong());
-                                    ui.label(
-                                        RichText::new(format!("{} · {}", song.singer, song.source))
-                                            .color(theme.muted)
-                                            .size(12.0),
-                                    );
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.small_button("+").on_hover_text("加入队列").clicked()
-                                    {
-                                        queue_add = Some(song.clone());
-                                    }
-                                    ui.label(
-                                        RichText::new(format_duration(Duration::from_millis(
-                                            song.duration_ms,
-                                        )))
-                                        .color(theme.muted)
-                                        .size(12.0),
-                                    );
-                                });
-                            });
-                            let response = ui.interact(
-                                ui.min_rect(),
-                                ui.scope_id().with(("search_row", index)),
-                                Sense::click(),
+                            // 整行的可点区域必须在创建子控件**之前**注册（`UiBuilder::sense`
+                            // 在 `Ui::new` 里入栈），否则后注册的整行矩形会在命中测试里盖住
+                            // 行内的按钮，点「+」就永远收不到点击。
+                            let row = ui.scope_builder(
+                                egui::UiBuilder::new().sense(Sense::click()),
+                                |ui| {
+                                    ui.horizontal(|ui| {
+                                        self.thumbnail(ui, covering.as_ref(), 34.0, theme);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(&song.name)
+                                                    .color(theme.text)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} · {}",
+                                                    song.singer, song.source
+                                                ))
+                                                .color(theme.muted)
+                                                .size(12.0),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("+")
+                                                    .on_hover_text("加入队列")
+                                                    .clicked()
+                                                {
+                                                    queue_add = Some(song.clone());
+                                                }
+                                                ui.label(
+                                                    RichText::new(format_duration(
+                                                        Duration::from_millis(song.duration_ms),
+                                                    ))
+                                                    .color(theme.muted)
+                                                    .size(12.0),
+                                                );
+                                            },
+                                        );
+                                    });
+                                },
                             );
+                            let response = row.response;
                             if response.double_clicked() {
                                 play = Some(index);
                             }
@@ -415,39 +432,56 @@ impl UiState {
                         .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(if current { "▶" } else { "·" })
-                                        .color(theme.accent),
-                                );
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(&song.name).color(theme.text));
-                                    ui.label(
-                                        RichText::new(&song.singer).color(theme.muted).size(12.0),
-                                    );
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.small_button("×").on_hover_text("移除").clicked() {
-                                        remove = Some(index);
-                                    }
-                                    if index + 1 < total
-                                        && ui.small_button("↓").on_hover_text("下移").clicked()
-                                    {
-                                        move_down = Some(index);
-                                    }
-                                    if index > 0
-                                        && ui.small_button("↑").on_hover_text("上移").clicked()
-                                    {
-                                        move_up = Some(index);
-                                    }
-                                });
-                            });
-                            let response = ui.interact(
-                                ui.min_rect(),
-                                ui.scope_id().with(("queue_row", index)),
-                                Sense::click(),
+                            // 同搜索行：整行可点区域先于子控件注册，避免盖住
+                            // 「×」「↑」「↓」按钮。
+                            let row = ui.scope_builder(
+                                egui::UiBuilder::new().sense(Sense::click()),
+                                |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if current { "▶" } else { "·" })
+                                                .color(theme.accent),
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(&song.name).color(theme.text));
+                                            ui.label(
+                                                RichText::new(&song.singer)
+                                                    .color(theme.muted)
+                                                    .size(12.0),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("×")
+                                                    .on_hover_text("移除")
+                                                    .clicked()
+                                                {
+                                                    remove = Some(index);
+                                                }
+                                                if index + 1 < total
+                                                    && ui
+                                                        .small_button("↓")
+                                                        .on_hover_text("下移")
+                                                        .clicked()
+                                                {
+                                                    move_down = Some(index);
+                                                }
+                                                if index > 0
+                                                    && ui
+                                                        .small_button("↑")
+                                                        .on_hover_text("上移")
+                                                        .clicked()
+                                                {
+                                                    move_up = Some(index);
+                                                }
+                                            },
+                                        );
+                                    });
+                                },
                             );
-                            if response.double_clicked() {
+                            if row.response.double_clicked() {
                                 play = Some(index);
                             }
                         });

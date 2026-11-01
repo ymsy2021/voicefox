@@ -48,6 +48,9 @@ pub struct VoicefoxGuiController {
     backend: Box<dyn GuiBackend>,
     snapshot: Snapshot,
     search_input: String,
+    /// 上一次从快照回填到搜索框的关键词。搜索框是用户的输入缓冲，
+    /// 只有这个值真的变了才允许覆盖（见 [`Self::apply_snapshot`]）。
+    synced_keyword: String,
     status: Option<String>,
     /// 上一条已经展示过的通知（避免同一通知每秒重刷状态栏）。
     seen_notification: Option<String>,
@@ -70,7 +73,8 @@ impl VoicefoxGuiController {
         Self {
             backend,
             snapshot: initial,
-            search_input,
+            search_input: search_input.clone(),
+            synced_keyword: search_input,
             status: None,
             seen_notification: None,
         }
@@ -90,7 +94,13 @@ impl VoicefoxGuiController {
             self.seen_notification = snapshot.notification.clone();
             self.status = snapshot.notification.clone();
         }
-        self.search_input = snapshot.search.keyword.clone();
+        // 搜索框归用户所有：服务线程每 250ms 推一次快照，若无条件回写，
+        // 用户敲进去的字会在下一帧被快照里的旧关键词清空（输入不进去）。
+        // 只有当服务端的搜索关键词确实变化时才同步（例如换源/自动搜索）。
+        if snapshot.search.keyword != self.synced_keyword {
+            self.synced_keyword = snapshot.search.keyword.clone();
+            self.search_input = snapshot.search.keyword.clone();
+        }
         self.snapshot = snapshot;
     }
 
