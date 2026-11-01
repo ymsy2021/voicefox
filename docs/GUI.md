@@ -41,6 +41,10 @@ sudo apt install libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev libgl1-m
 尚未包含：收藏/历史/歌单页面、扫码登录与音源切换、下载面板、系统托盘、Windows SMTC 与
 macOS Now Playing 的 GUI 接入（TUI 侧仍保留这些平台后端）。这些是后续迭代。
 
+发布资产：`.github/workflows/release.yml` 目前只打包 TUI 二进制（`voicefox`）。是否把
+`voicefox-gui` 一起放进各平台压缩包、以及 Linux 的 `libmpv-dev`/窗口库打包取舍，属于发布流程
+决策，留待维护者确认后再改。
+
 ## 架构
 
 ```
