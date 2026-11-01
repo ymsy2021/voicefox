@@ -10,6 +10,10 @@ pub mod fmt;
 pub mod mode;
 #[cfg(target_os = "linux")]
 pub mod mpris;
+#[cfg(target_os = "macos")]
+pub mod nowplaying;
+#[cfg(target_os = "windows")]
+pub mod smtc;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -218,6 +222,38 @@ fn file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
+/// 同步启动（Windows SMTC / macOS Now Playing 的后端不经过 tokio）。
+///
+/// Linux 的 MPRIS 建 D-Bus 连接是异步的，请用 [`start_media_controls`]。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn start_media_controls_sync(
+    enabled: bool,
+) -> (
+    Option<MediaHandle>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<MediaCommand>>,
+) {
+    if !enabled {
+        return (None, None);
+    }
+    let result = {
+        #[cfg(target_os = "windows")]
+        {
+            smtc::start()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            nowplaying::start()
+        }
+    };
+    match result {
+        Ok((handle, receiver)) => (Some(handle), Some(receiver)),
+        Err(error) => {
+            tracing::warn!("media controls unavailable: {error:#}");
+            (None, None)
+        }
+    }
+}
+
 /// 启动平台媒体控件后端；平台不支持、配置关闭或启动失败时返回 `(None, None)`。
 ///
 /// 失败只记日志，不阻断播放。必须 await：MPRIS 建 D-Bus 连接是异步的，
@@ -247,6 +283,38 @@ pub async fn start_media_controls(
             tracing::warn!("media controls unavailable: {error:#}");
             (None, None)
         }
+    }
+}
+
+/// Windows/macOS 共用：把 souvlaki 的控件事件翻译成播放器命令。
+///
+/// Linux MPRIS 走 zbus，事件在 [``mpris``] 里直接翻译。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn translate_event(event: souvlaki::MediaControlEvent) -> Option<MediaCommand> {
+    use souvlaki::{MediaControlEvent, SeekDirection};
+
+    match event {
+        MediaControlEvent::Play => Some(MediaCommand::Play),
+        MediaControlEvent::Pause => Some(MediaCommand::Pause),
+        MediaControlEvent::Toggle => Some(MediaCommand::Toggle),
+        MediaControlEvent::Stop => Some(MediaCommand::Stop),
+        MediaControlEvent::Next => Some(MediaCommand::Next),
+        MediaControlEvent::Previous => Some(MediaCommand::Previous),
+        MediaControlEvent::Seek(SeekDirection::Forward) => Some(MediaCommand::SeekBy(5_000_000)),
+        MediaControlEvent::Seek(SeekDirection::Backward) => Some(MediaCommand::SeekBy(-5_000_000)),
+        MediaControlEvent::SeekBy(direction, amount) => {
+            let offset = i64::try_from(amount.as_micros()).unwrap_or(i64::MAX);
+            Some(MediaCommand::SeekBy(match direction {
+                SeekDirection::Forward => offset,
+                SeekDirection::Backward => -offset,
+            }))
+        }
+        MediaControlEvent::SetPosition(position) => Some(MediaCommand::SetPosition(position.0)),
+        // 音量键由系统混音器处理；打开 URI 暂未接入 souvlaki 后端。
+        MediaControlEvent::SetVolume(_)
+        | MediaControlEvent::OpenUri(_)
+        | MediaControlEvent::Raise
+        | MediaControlEvent::Quit => None,
     }
 }
 

@@ -33,6 +33,27 @@ ratatui-themes.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
+# Windows SMTC / macOS Now Playing 的 souvlaki 后端（与旧的 TUI 侧同一套依赖）
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+souvlaki = { version = "0.8", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFDate",
+    "CFRunLoop",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    # 隐藏窗口的消息泵：注册窗口类需要 GDI 特性
+    "Win32_Graphics_Gdi",
+] }
+
 [dev-dependencies]
 walkdir.workspace = true
 

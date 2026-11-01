@@ -61,7 +61,18 @@ pub(crate) fn start_media_controls(
             config.integration.now_playing
         }
     };
-    let (handle, commands) = rt.block_on(lk_media::start_media_controls(enabled));
+    let (handle, commands) = {
+        #[cfg(target_os = "linux")]
+        {
+            rt.block_on(lk_media::start_media_controls(enabled))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Windows SMTC / macOS Now Playing 不经过 tokio：后端自己开线程。
+            let _ = rt;
+            lk_media::start_media_controls_sync(enabled)
+        }
+    };
     if handle.is_none() && enabled {
         let backend = if cfg!(target_os = "linux") {
             "MPRIS"

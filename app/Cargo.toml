@@ -54,14 +54,12 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 rustix = { version = "1", default-features = false, features = ["std", "termios"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-souvlaki = { version = "0.8", default-features = false }
 libc = "0.2"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "CFDate",
-    "CFRunLoop",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -99,8 +97,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
-    "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
 ] }
-souvlaki = { version = "0.8", default-features = false }
