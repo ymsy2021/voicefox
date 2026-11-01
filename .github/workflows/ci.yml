@@ -26,7 +26,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmpv-dev
+          # egui/eframe 的桌面后端：Wayland / X11 客户端库与 Khronos GL 头文件
+          sudo apt-get install -y libmpv-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libgl1-mesa-dev
+
+      # 桌面 GUI 的中文字体是原生依赖，与 libmpv 一样不随仓库分发
+      - name: Prepare GUI assets
+        run: ./scripts/fetch-gui-assets.sh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -49,10 +55,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmpv-dev
+          sudo apt-get install -y libmpv-dev libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcb1-dev libgl1-mesa-dev
+
+      - name: Prepare GUI assets
+        run: ./scripts/fetch-gui-assets.sh
 
       - name: Build
-        run: cargo build --release --verbose
+        run: |
+          cargo build --release --verbose
+          # 桌面 GUI（egui）：与 TUI 共用核心与 MPRIS，产物名 voicefox-gui
+          cargo build --release --verbose --package voicefox-gui
 
       - name: Run tests
         run: cargo test --release --verbose
@@ -61,7 +74,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: voicefox-linux-x86_64
-          path: target/release/voicefox
+          path: |
+            target/release/voicefox
+            target/release/voicefox-gui
           if-no-files-found: error
           retention-days: 1
 

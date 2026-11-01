@@ -1,6 +1,6 @@
 //! Linux MPRIS 服务，供 Waybar、桌面媒体键和播放器控件使用。
 //!
-//! 快照 / 命令的数据结构在 [`crate::media_session`]（与 Windows SMTC 共用），
+//! 快照 / 命令的数据结构与 TUI、GUI 共用（[`crate::media`]），
 //! 这里只做 zbus 协议翻译：把 [`MediaSnapshot`] 映射到 org.mpris.MediaPlayer2
 //! 属性，把桌面发来的 D-Bus 调用转成 [`MediaCommand`]。
 
@@ -10,7 +10,7 @@ use std::time::Duration;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use crate::media_session::{MediaCommand, MediaHandle, MediaSnapshot};
+use crate::media::{MediaCommand, MediaHandle, MediaSnapshot};
 
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 
@@ -19,7 +19,7 @@ pub async fn start() -> anyhow::Result<(
     tokio::sync::mpsc::UnboundedReceiver<MediaCommand>,
 )> {
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (handle, update_rx) = crate::media_session::channel();
+    let (handle, update_rx) = crate::media::channel();
     let initial = MediaSnapshot::default();
     let root = MediaPlayer2 {
         command_tx: command_tx.clone(),
@@ -154,7 +154,9 @@ impl MprisPlayer {
             )));
     }
 
-    fn open_uri(&self, _uri: &str) {}
+    fn open_uri(&self, uri: &str) {
+        let _ = self.command_tx.send(MediaCommand::OpenUri(uri.to_string()));
+    }
 
     #[zbus(property)]
     fn playback_status(&self) -> &'static str {

@@ -1,10 +1,12 @@
 # voicefox
 
-> Rust / ratatui / libmpv 终端音乐播放器
+> Rust / ratatui / egui / libmpv 音乐播放器：终端（TUI）与桌面窗口（GUI）两个前端
 
 [![CI](https://github.com/emoeem/voicefox/actions/workflows/ci.yml/badge.svg)](https://github.com/emoeem/voicefox/actions/workflows/ci.yml)
 
-voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、下载、收藏、历史和歌单管理整合进键盘优先的终端界面。当前 0.8.0 发布线使用稳定旧版 TUI，同时集成新的音源、下载、登录和跨平台能力。
+voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、下载、收藏、历史和歌单管理整合进键盘优先的终端界面。当前 0.8.x 发布线使用稳定 TUI，同时集成新的音源、下载、登录和跨平台能力。
+
+0.9 起另有一个共��同一份核心的桌面窗口（`voicefox-gui`，egui/eframe）：不需要终端，有搜索、播放、队列排序、歌词与系统媒体键。两个前端都在 `ApplicationService` 之上，播放后端仍是 libmpv，配置、历史、收藏与歌单完全共用。
 
 ## 主要功能
 
@@ -17,6 +19,7 @@ voicefox 将多音源音乐搜索、在线播放、本地音乐库、歌词、�
 - 收藏、历史、自建歌单、排行榜、热门歌单
 - Kitty / Sixel / iTerm2 封面协议与 Unicode fallback
 - Linux D-Bus/MPRIS、Windows SMTC、macOS Now Playing 媒体键与桌面提示路径
+- 桌面窗口：搜索/播放、队列排序、歌词页、系统媒体键（与 TUI 共用核心，见 [`GUI.md`](docs/GUI.md)）
 - lx-music 兼容 JS 自定义音源
 - 可配置快捷键与运行时帮助
 - 跨音源歌单/收藏同步：Diff 预览、双向增量、持久化歌单映射与未匹配提示
@@ -95,8 +98,14 @@ brew install mpv
 git clone https://github.com/emoeem/voicefox.git
 cd voicefox
 cargo build --release
-cargo run --release
+cargo run --release                    # 终端界面（TUI）
+./scripts/fetch-gui-assets.sh          # 桌面 GUI 的中文字体（与 libmpv 同类原生依赖）
+cargo run --release -p voicefox-gui    # 桌面窗口（GUI）
 ```
+
+GUI 需要与 TUI 相同的 libmpv，另外需要桌面窗口系统的开发库：
+Debian/Ubuntu 上 `sudo apt install libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev libgl1-mesa-dev`。
+没有网络或音频设备时可以 `cargo run -p voicefox-gui --bin voicefox-gui-demo` 查看界面。
 
 ## 文档
 
@@ -104,6 +113,7 @@ cargo run --release
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) — 功能、音源与平台说明
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — 配置
 - [`docs/SYNC.md`](docs/SYNC.md) — 跨音源同步、Diff、匹配与登录限制
+- [`docs/GUI.md`](docs/GUI.md) — 桌面窗口的能力范围、与 TUI/Flutter 的关系与已知限制
 - [`flutter/README.md`](flutter/README.md) — Flutter/Rust 新架构开发线
 
 ## 验证
@@ -111,6 +121,7 @@ cargo run --release
 ```bash
 cargo fmt --all
 cargo test -p voicefox-app
+cargo test -p voicefox-gui
 cargo test -p lx-core
 cargo test -p lx-lyric
 cargo check -p voicefox-app --target x86_64-pc-windows-gnu

@@ -1,7 +1,8 @@
 //! 平台媒体控件的胶水层：快照构建、后端启动、桌面命令执行。
 //!
 //! 从 main.rs 拆出的第一块：这一组函数只依赖 `crate::execute_action` 与
-//! `AppContext`，与 TUI 渲染无关，Linux（MPRIS）与 Windows（SMTC）共用。
+//! `AppContext`，与 TUI 渲染无关。快照构建、后端启动与媒体键数据流本身
+//! 已在 `voicefox_runtime::media`，与桌面 GUI 共用。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -12,15 +13,16 @@ use lx_core::model::song::SongInfo;
 use lx_core::model::source::PlayerState;
 
 use crate::context::AppContext;
-use crate::media_session;
 use crate::pages;
 use lx_core::events::Notification;
 
 use tokio::sync::mpsc;
+use voicefox_runtime::media as lk_media;
+
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-pub(crate) fn current_media_snapshot(ctx: &AppContext) -> media_session::MediaSnapshot {
+pub(crate) fn current_media_snapshot(ctx: &AppContext) -> lk_media::MediaSnapshot {
     let song = ctx.current_song.read().unwrap_or_else(|e| e.into_inner());
-    media_session::MediaSnapshot::new(
+    lk_media::MediaSnapshot::build(
         *ctx.player_state.borrow(),
         song.as_ref(),
         *ctx.position.borrow(),
@@ -32,16 +34,17 @@ pub(crate) fn current_media_snapshot(ctx: &AppContext) -> media_session::MediaSn
     )
 }
 
-/// 启动平台媒体控件后端（Linux MPRIS / Windows SMTC / macOS Now Playing）。
+/// 启动平台媒体控件后端（Linux MPRIS）。
 ///
-/// 返回 `(None, None)` 表示平台不支持、配置关闭或启动失败。
+/// 后端实现与 GUI 共用 `voicefox_runtime::media`，这里只把 TUI 侧的配置
+/// 开关门控进去。返回 `(None, None)` 表示配置关闭、平台不支持或启动失败。
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub(crate) fn start_media_controls(
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
 ) -> (
-    Option<media_session::MediaHandle>,
-    Option<tokio::sync::mpsc::UnboundedReceiver<media_session::MediaCommand>>,
+    Option<lk_media::MediaHandle>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<lk_media::MediaCommand>>,
 ) {
     let enabled = {
         let config = ctx.config.read().unwrap_or_else(|e| e.into_inner());
@@ -58,48 +61,24 @@ pub(crate) fn start_media_controls(
             config.integration.now_playing
         }
     };
-    // SMTC / Now Playing 不经过 tokio（souvlaki 直接开线程），
-    // 参数只为与 MPRIS 路径同构。
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let _ = rt;
-    if !enabled {
-        return (None, None);
+    let (handle, commands) = rt.block_on(lk_media::start_media_controls(enabled));
+    if handle.is_none() && enabled {
+        let backend = if cfg!(target_os = "linux") {
+            "MPRIS"
+        } else if cfg!(target_os = "windows") {
+            "SMTC"
+        } else {
+            "Now Playing"
+        };
+        ctx.notify(Notification::warning(format!("{backend} 启动失败")).tui_only());
     }
-    let result = {
-        #[cfg(target_os = "linux")]
-        {
-            rt.block_on(crate::mpris::start())
-        }
-        #[cfg(target_os = "windows")]
-        {
-            crate::smtc::start()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::nowplaying::start()
-        }
-    };
-    match result {
-        Ok((handle, receiver)) => (Some(handle), Some(receiver)),
-        Err(error) => {
-            tracing::warn!("media controls unavailable: {error:#}");
-            let backend = if cfg!(target_os = "linux") {
-                "MPRIS"
-            } else if cfg!(target_os = "windows") {
-                "SMTC"
-            } else {
-                "Now Playing"
-            };
-            ctx.notify(Notification::warning(format!("{backend} 启动失败: {error:#}")).tui_only());
-            (None, None)
-        }
-    }
+    (handle, commands)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_media_command(
-    command: media_session::MediaCommand,
+    command: lk_media::MediaCommand,
     ctx: &AppContext,
     rt: &tokio::runtime::Runtime,
     action_tx: &mpsc::UnboundedSender<AppAction>,
@@ -107,7 +86,7 @@ pub(crate) fn execute_media_command(
     settings_page: &Arc<std::sync::Mutex<pages::settings::SettingsPage>>,
     search_seq: &Arc<AtomicU64>,
 ) -> bool {
-    use media_session::MediaCommand;
+    use lk_media::MediaCommand;
 
     let play_entry = |entry: Option<(Arc<Vec<SongInfo>>, usize)>| {
         if let Some((songs, index)) = entry {
@@ -145,6 +124,23 @@ pub(crate) fn execute_media_command(
             ctx.seek(Duration::from_micros(target.min(u64::MAX as u128) as u64));
         }
         MediaCommand::SetPosition(position) => ctx.seek(position),
+        MediaCommand::OpenUri(uri) => {
+            // 桌面「用 voicefox 打开」：把本地文件作为队列起播。
+            if let Some(song) = lk_media::song_from_uri(&uri) {
+                crate::execute_action(
+                    AppAction::PlayFromQueue {
+                        songs: Arc::new(vec![song]),
+                        index: 0,
+                    },
+                    ctx,
+                    rt,
+                    action_tx,
+                    search_page,
+                    settings_page,
+                    search_seq,
+                );
+            }
+        }
         MediaCommand::SetVolume(volume) => {
             persist_volume(ctx, (volume.clamp(0.0, 1.0) * 100.0).round() as u32);
         }

@@ -49,6 +49,8 @@ pub struct ApplicationService {
     playlists: PlaylistService,
     request_id: Arc<AtomicU64>,
     playback_request_id: Arc<AtomicU64>,
+    /// 播放器事件是否已接上（`bind_player_events` 幂等）。
+    bound: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ApplicationService {
@@ -70,6 +72,7 @@ impl ApplicationService {
             playlists: PlaylistService::with_sources(Arc::clone(&sources)),
             request_id: Arc::new(AtomicU64::new(0)),
             playback_request_id: Arc::new(AtomicU64::new(0)),
+            bound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -81,6 +84,20 @@ impl ApplicationService {
 
     pub fn state(&self) -> ApplicationState {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 播放器的实时状态（被动变化可能还没同步进 state）。
+    pub fn player_state(&self) -> PlayerState {
+        *self.playback.player().state_watcher().borrow()
+    }
+
+    /// 重新起播队列当前曲目。
+    async fn dispatch_play_current(&self) -> Result<(), String> {
+        let (songs, index) = self.queue.snapshot();
+        if songs.get(index).is_none() {
+            return Ok(());
+        }
+        self.play(songs, index).await
     }
 
     pub fn playback(&self) -> PlaybackService {
@@ -120,9 +137,15 @@ impl ApplicationService {
                 Ok(())
             }
             ApplicationCommand::Resume => {
-                self.playback.resume();
-                self.emit(ApplicationEvent::PlaybackResumed);
-                Ok(())
+                // 玩家可能已经停止（主动停止/出错后状态为 Stopped），此时
+                // resume 起不来；按播放器的实际状态决定续播还是从头起播。
+                if self.player_state() == PlayerState::Stopped {
+                    self.dispatch_play_current().await
+                } else {
+                    self.playback.resume();
+                    self.emit(ApplicationEvent::PlaybackResumed);
+                    Ok(())
+                }
             }
             ApplicationCommand::Toggle => {
                 self.playback.toggle();
@@ -464,6 +487,86 @@ impl ApplicationService {
             .unwrap_or_else(|e| e.into_inner())
             .playlists = playlists.clone();
         self.emit(ApplicationEvent::PlaylistChanged { playlists });
+    }
+
+    /// 绑定播放器生命周期：订阅 `PlayerEvent` / 状态观察者，把被动变化
+    /// （自然播完、暂停/恢复、播放错误、停止）更新进 state 与事件流。
+    ///
+    /// 必须在 tokio runtime 内调用；重复调用无效。TUI 主循环与 GUI 服务线程
+    /// 运的是同一个 ApplicationService 实例，因此两边行为一致。
+    pub fn bind_player_events(&self) {
+        let player = self.playback.player();
+        if self.bound.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut events_rx = player.take_event_receiver();
+        if let Some(mut events_rx) = events_rx.take() {
+            let service = self.clone();
+            spawn_reported(self.events.clone(), "播放器事件", async move {
+                while let Some(event) = events_rx.recv().await {
+                    service.handle_player_event(event);
+                }
+            });
+        }
+        let mut state_rx = player.state_watcher();
+        let service = self.clone();
+        spawn_reported(self.events.clone(), "播放器状态", async move {
+            loop {
+                if state_rx.changed().await.is_err() {
+                    return;
+                }
+                let value = *state_rx.borrow_and_update();
+                service.sync_player_state(value);
+            }
+        });
+    }
+
+    /// 播放器被动状态变化 → ApplicationState + 事件。
+    ///
+    /// 只同步 UI 状态，**不**自动切歌：自然播完由前端层（TUI 主循环 /
+    /// GUI 服务线程）按各自的播放模式推进，服务层只负责把真相记下来。
+    fn sync_player_state(&self, value: PlayerState) {
+        {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if state.playback.state == value {
+                return;
+            }
+            state.playback.state = value;
+        }
+        let event = match value {
+            PlayerState::Paused => ApplicationEvent::PlaybackPaused,
+            PlayerState::Playing => ApplicationEvent::PlaybackResumed,
+            PlayerState::Stopped => ApplicationEvent::PlaybackStopped,
+            PlayerState::Idle => ApplicationEvent::PlaybackEnded,
+            PlayerState::Loading => return,
+        };
+        self.emit(event);
+    }
+
+    /// 播放器生命周期事件：只把「当前代次的错误」报给界面。
+    ///
+    /// 自然播完已在 `sync_player_state` 里记为 Idle（并发 PlaybackEnded），
+    /// 切歌逻辑留给前端层，避免服务层与 TUI 的播放模式各推一次。
+    fn handle_player_event(&self, event: lx_core::traits::player::PlayerEvent) {
+        use lx_core::traits::player::PlayerEvent;
+        if let PlayerEvent::Error {
+            generation,
+            message,
+        } = event
+        {
+            if generation != self.state().playback.generation {
+                return;
+            }
+            self.state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .playback
+                .state = PlayerState::Stopped;
+            self.emit(ApplicationEvent::PlaybackFailed {
+                request_id: self.request_id.load(Ordering::Acquire),
+                error: message,
+            });
+        }
     }
 
     fn emit(&self, event: ApplicationEvent) {

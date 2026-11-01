@@ -1,0 +1,40 @@
+[package]
+name = "voicefox-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+[[bin]]
+name = "voicefox-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "voicefox-gui-demo"
+path = "src/bin/voicefox-gui-demo.rs"
+
+[dev-dependencies]
+tokio.workspace = true
+egui_kittest = { version = "0.37", features = ["snapshot", "wgpu"] }
+
+[dependencies]
+lx-core = { path = "../core" }
+lx-player = { path = "../player" }
+voicefox-application = { path = "../application" }
+voicefox-runtime = { path = "../runtime" }
+
+tokio.workspace = true
+anyhow.workspace = true
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.37"
+image.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["desktop-mpv"]
+desktop-mpv = ["voicefox-runtime/desktop-mpv"]
