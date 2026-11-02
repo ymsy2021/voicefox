@@ -29,6 +29,8 @@ image.workspace = true
 
 ratatui.workspace = true
 ratatui-themes.workspace = true
+thiserror.workspace = true
+md-5.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

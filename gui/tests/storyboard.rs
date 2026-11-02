@@ -73,16 +73,16 @@ fn steps() -> Vec<Step> {
             run: Box::new(|stage: &mut Stage| {
                 stage.ui.tab = Tab::Queue;
             }),
-            expect: &["清空", "调整顺序"],
+            expect: &["清空", "拖动排序"],
             absent: &[],
         },
         Step {
             name: "queue-reordered",
             run: Box::new(|stage: &mut Stage| {
-                // 拖动排序：把第 1 首挪到第 3 位。
-                stage.send(GuiRequest::MoveQueue { from: 0, to: 2 });
+                // 拖动排序的结果落到同一条请求上（UI 拖动结束时发的就是它）。
+                stage.send(GuiRequest::ReorderQueue { from: 0, to: 2 });
             }),
-            expect: &[],
+            expect: &["夜曲"],
             absent: &[],
         },
         Step {
@@ -91,7 +91,66 @@ fn steps() -> Vec<Step> {
                 stage.command(ApplicationCommand::Toggle);
                 stage.ui.tab = Tab::Lyrics;
             }),
-            expect: &["已暂停", "歌词"],
+            expect: &["已暂停", "歌词", "翻译", "逐字"],
+            absent: &[],
+        },
+        Step {
+            name: "lyrics-translation",
+            run: Box::new(|stage: &mut Stage| {
+                stage.send(GuiRequest::ToggleLyric(
+                    voicefox_gui::service::LyricToggle::Translation,
+                ));
+                // 演示后端没有真的核心，这里把「当前行译文」放进快照，
+                // 断言界面确实把翻译画在当前行下面。
+                stage
+                    .backend
+                    .set_lyric_translation(Some("（演示）翻译行".into()));
+            }),
+            expect: &["（演示）翻译行"],
+            absent: &[],
+        },
+        Step {
+            name: "library-favorites",
+            run: Box::new(|stage: &mut Stage| {
+                stage.send(GuiRequest::RefreshLibrary);
+                stage.ui.tab = Tab::Library;
+                stage.ui.library_tab = voicefox_gui::ui::LibraryTab::Favorites;
+            }),
+            expect: &["收藏", "历史", "歌单", "夜曲"],
+            absent: &[],
+        },
+        Step {
+            name: "library-playlists",
+            run: Box::new(|stage: &mut Stage| {
+                stage.ui.library_tab = voicefox_gui::ui::LibraryTab::Playlists;
+            }),
+            expect: &["新建", "通勤歌单"],
+            absent: &[],
+        },
+        Step {
+            name: "sources-qr",
+            run: Box::new(|stage: &mut Stage| {
+                stage.ui.tab = Tab::Sources;
+                stage.send(GuiRequest::StartLogin("kg".into()));
+            }),
+            expect: &["音源", "酷狗", "扫码登录"],
+            absent: &[],
+        },
+        Step {
+            name: "downloads",
+            run: Box::new(|stage: &mut Stage| {
+                stage.ui.tab = Tab::Downloads;
+                let song = stage
+                    .backend
+                    .take_snapshot()
+                    .search
+                    .items
+                    .first()
+                    .cloned()
+                    .expect("搜索结果");
+                stage.send(GuiRequest::DownloadSong(song));
+            }),
+            expect: &["下载", "取消", "夜曲"],
             absent: &[],
         },
     ]
@@ -166,6 +225,26 @@ fn storyboard_renders_every_main_state() {
     }
 }
 
+/// 队列拖动排序：界面发出的请求走服务层，索引校正与核心同一个规则。
+#[test]
+fn queue_reorder_request_is_forwarded_as_core_command() {
+    let backend = Arc::new(DemoBackend::with_queue_preset(true));
+    let mut controller = VoicefoxGuiController::with_backend(
+        &egui::Context::default(),
+        Box::new(Arc::clone(&backend)),
+    );
+    controller.send(GuiRequest::ReorderQueue { from: 0, to: 2 });
+    let snapshot = backend.take_snapshot();
+    assert_eq!(snapshot.queue.len(), 3);
+    assert!(
+        backend
+            .requests()
+            .iter()
+            .any(|request| matches!(request, GuiRequest::ReorderQueue { from: 0, to: 2 })),
+        "拖动排序必须以一条请求交给服务线程"
+    );
+}
+
 /// 队列排序本身的行为（不依赖网络，直接检查演示后端的状态迁移）。
 #[test]
 fn queue_reorder_keeps_track_order() {
@@ -178,7 +257,7 @@ fn queue_reorder_keeps_track_order() {
         .collect();
     assert!(before.len() >= 3, "预设队列至少 3 首");
     backend
-        .send(GuiRequest::MoveQueue { from: 0, to: 2 })
+        .send(GuiRequest::ReorderQueue { from: 0, to: 2 })
         .expect("move request");
     let after: Vec<String> = backend
         .take_snapshot()
@@ -339,12 +418,22 @@ fn row_buttons_receive_real_pointer_clicks() {
     harness.get_by_label("队列").click();
     harness.run_steps(2);
     let before_remove = backend.take_snapshot().queue.len();
+    // 队列行里现在既有「×」也有拖动把手「≡」，按钮顺序随布局变化；
+    // 这里按可访问名精确取「×」，避免误点到相邻控件。
     harness
         .get_all_by_label("×")
         .next()
         .expect("「×」按钮")
         .click();
     harness.run_steps(2);
+    let requests = backend.requests();
+    assert!(
+        requests.iter().any(|request| matches!(
+            request,
+            GuiRequest::Dispatch(ApplicationCommand::QueueRemove { .. })
+        )),
+        "点「×」应当发出 QueueRemove：{requests:?}"
+    );
     let after_remove = backend.take_snapshot().queue.len();
     assert_eq!(
         after_remove,

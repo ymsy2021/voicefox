@@ -31,15 +31,18 @@ sudo apt install libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev libgl1-m
 | 可启动窗口 | ✅ 1200×760 起，可缩放；嵌入 Noto Sans CJK，中文不缺字 |
 | 搜索 | ✅ 多音源聚合检索、加载更多、右键菜单（播放 / 下一首播放 / 加入队列） |
 | 播放 | ✅ 双击结果即播放并铺满整张结果列表，播放/暂停/上一首/下一首、拖动进度、音量 |
-| 队列 | ✅ 双击播放、上移/下移排序、移除、清空 |
-| 歌词 | ✅ 歌词页与正在播放页的当前行（LRC/KRC/QRC/YRC 由核心解析） |
+| 队列 | ✅ 拖动排序（egui 拖放，落到核心 `QueueMove`）、双击播放、移除、清空 |
+| 歌词 | ✅ 歌词页与正在播放页的当前行；**译文**、**YRC 逐字高亮**、换行时滚动跟随；「翻译 / 逐字」开关写回配置 |
+| 收藏 / 历史 / 歌单 | ✅ 三个子页 + 增删改查，直接读写 TUI 同一份 `Storage`（收藏、历史、自建歌单）；搜索右键「收藏 / 加入歌单…」 |
+| 扫码登录 / 音源 | ✅ 酷狗 / QQ / 网易云 / 哔哩哔哩（及所有内置在线音源）扫码登录，二维码与状态轮询在服务线程；启用 / 停用 / 设默认与 TUI 设置页同一套配置语义 |
+| 下载 | ✅ 复用共享并发分片下载：进度、速度（两次快照增量估计）、取消、清理已结束、保存目录 |
 | 系统媒体键 | ✅ Linux MPRIS（媒体键、Waybar、GNOME/KDE 媒体浮层），进度与元数据同步；`OpenUri` 可直接播放本地文件 |
 | 播放模式 | ✅ 列表循环 / 单曲循环 / 随机 / 顺序 / 播完停止，停在结尾后可一键重新播放 |
 | 主题 | ✅ 跟随 `[theme]` 配置与主题库具名主题，与 TUI 同一份取色 |
 | TUI | ✅ 保留并共用核心；`cargo run` 行为不变 |
 
-尚未包含：收藏/历史/歌单页面、扫码登录与音源切换、下载面板、系统托盘、Windows SMTC 与
-macOS Now Playing 的 GUI 接入（TUI 侧仍保留这些平台后端）。这些是后续迭代。
+P2 尚未包含：系统托盘与最小化到托盘、主题跟随系统外观、完整设置页；
+Windows SMTC 与 macOS Now Playing 的 GUI 接入（TUI 侧仍保留这些平台后端）。
 
 发布资产：`.github/workflows/release.yml` 目前只打包 TUI 二进制（`voicefox`）。是否把
 `voicefox-gui` 一起放进各平台压缩包、以及 Linux 的 `libmpv-dev`/窗口库打包取舍，属于发布流程
@@ -84,8 +87,8 @@ cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 ### 界面快照
 
 `gui/tests/storyboard.rs` 用真实绘制 + 演示后端走一遍主要状态（空搜索 → 结果 →
-播放 → 队列 → 拖动排序 → 暂停/歌词），并断言界面文字。设 `VOICEFOX_GUI_SCREENSHOT=<目录>`
-时每一步还会输出 PNG：
+播放 → 队列 → 拖动排序 → 暂停/歌词 → 译文 → 收藏 → 歌单 → 扫码 → 下载），并断言界面
+文字。设 `VOICEFOX_GUI_SCREENSHOT=<目录>` 时每一步还会输出 PNG：
 
 ```bash
 VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard storyboard_renders -- --nocapture
@@ -108,15 +111,16 @@ VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard 
 
 - Windows SMTC / macOS Now Playing 目前只有 TUI 侧接入；GUI 在这些平台上仍可播放，
   但系统媒体键暂不可用。
-- 歌词每行按核心当前行高亮；逐字歌词（YRC 词级高亮）尚未在 GUI 渲染。
 - 播放列表里只有一首时没有"下一首"可补，重复播放依赖播放模式。
-- 队列排序通过重建队列实现（核心没有原地移动命令），正在播放的曲目会按重建后的索引
-  重新对齐。
+- 歌单页暂不支持重命名与歌单内排序（核心已有 `rename_custom_playlist`，界面尚未接入）。
+- 扫码登录只展示二维码与轮询状态；登录成功后的账号昵称依赖音源返回（部分音源不返回）。
+- 下载「重试」= 重新入队当前曲目（去重索引保证已完成的不重复下载）。
 ## 验收记录
 
 - 界面截图：`gui/tests/storyboard.rs`（演示后端，无网络）与真实应用截图（`VOICEFOX_GUI_SCREENSHOT`）。
   本仓库不随提交附带截图文件，复现命令见上文。
 - TUI 不变性：同一份二进制启动后首屏的终端输出与改动前 `main` 逐字节相同
-  （160×46 终端、空闲状态、无队列）。
+  （160×46 终端、空闲状态、无队列）；P1 分发层（下载搬到 runtime）后 TUI 仍正常启动。
+- P1 库操作：`gui/tests/library.rs` 用隔离数据目录验证「GUI 侧增删改查 = 共享 `Storage`」。
 - 真实链路：真实音源搜索（约 200 条结果）、播放、MPRIS 报告 `Playing` 与元数据/进度、
   D-Bus `PlayPause` / `Next` / `OpenUri` 在开发机上验证通过。

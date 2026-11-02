@@ -19,6 +19,8 @@ egui_kittest = { version = "0.37", features = ["snapshot", "wgpu"] }
 [dependencies]
 lx-core = { path = "../core" }
 lx-player = { path = "../player" }
+lx-lyric = { path = "../lyric" }
+lx-source = { path = "../source" }
 voicefox-application = { path = "../application" }
 voicefox-runtime = { path = "../runtime" }
 
@@ -34,6 +36,9 @@ eframe = { version = "0.37", default-features = false, features = [
 egui = "0.37"
 image.workspace = true
 tracing.workspace = true
+toml.workspace = true
+base64.workspace = true
+qrcode = { version = "0.4", default-features = false }
 
 [features]
 default = ["desktop-mpv"]

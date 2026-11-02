@@ -199,6 +199,10 @@ impl DownloadRecords {
         state.records.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// 清空记录与去重索引，并删除文件。
     pub fn clear(&self) -> Result<(), String> {
         {

@@ -33,6 +33,11 @@ pub enum ApplicationCommand {
         index: usize,
     },
     QueueClear,
+    /// 拖动排序：把第 `from` 首挪到第 `to` 位（索引超界时忽略）。
+    QueueMove {
+        from: usize,
+        to: usize,
+    },
     Next,
     Previous,
     PlaybackFailed {

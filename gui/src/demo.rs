@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::service::{
-    GuiBackend, GuiError, GuiRequest, PlaybackState, RepaintHandle, SearchView, Snapshot, TrackView,
+    DownloadItemView, GuiBackend, GuiError, GuiRequest, LibraryView, LoginView, LyricToggle,
+    LyricWord, LyricsView, PlaybackState, PlaylistView, RepaintHandle, SearchView, Snapshot,
+    SourcesView, TrackView,
 };
 use voicefox_runtime::media::PlayMode;
 
@@ -48,6 +50,18 @@ pub struct DemoHandle {
     repaint: RepaintHandle,
 }
 
+impl DemoBackend {
+    /// 演示脚本用：直接给歌词设一段翻译（真实现由核心解析）。
+    pub fn set_lyric_translation(&self, translation: Option<String>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .lyrics
+            .translation = translation;
+    }
+}
+
 impl DemoHandle {
     /// 读当前快照（测试与演示脚本用）。
     pub fn snapshot(&self) -> Snapshot {
@@ -82,6 +96,10 @@ impl GuiBackend for DemoHandle {
 
     fn repaint_handle(&self) -> RepaintHandle {
         self.repaint.clone()
+    }
+
+    fn request_refresh(&self) {
+        // 演示后端的下载 / 扫码都是即时状态，不需要额外刷新。
     }
 
     fn clone_backend(&self) -> Box<dyn GuiBackend> {
@@ -131,7 +149,33 @@ impl DemoBackend {
                 "失去你 爱恨开始分明".into(),
             ];
             snapshot.lyrics.current = 1;
+            snapshot.lyrics.translation = None;
         }
+        // 演示后端没有真实音源管理器：给一份与默认配置一致的音源列表。
+        snapshot.sources = SourcesView {
+            available: vec![
+                "kw".into(),
+                "kg".into(),
+                "tx".into(),
+                "wy".into(),
+                "mg".into(),
+                "bili".into(),
+                "qianqian".into(),
+            ],
+            enabled: vec![
+                "kw".into(),
+                "kg".into(),
+                "tx".into(),
+                "wy".into(),
+                "mg".into(),
+            ],
+            default: "kw".into(),
+            logged_in: Vec::new(),
+            login: None,
+            error: None,
+        };
+        snapshot.library = demo_library();
+        snapshot.downloads.download_dir = "~/.local/share/voicefox/downloads".into();
         Self {
             state: Arc::new(Mutex::new(DemoState {
                 snapshot,
@@ -218,6 +262,10 @@ impl GuiBackend for DemoBackend {
         self.repaint.clone()
     }
 
+    fn request_refresh(&self) {
+        // 演示后端的下载 / 扫码都是即时状态，不需要额外刷新。
+    }
+
     fn clone_backend(&self) -> Box<dyn GuiBackend> {
         Box::new(self.handle())
     }
@@ -242,8 +290,86 @@ impl GuiBackend for std::sync::Arc<DemoBackend> {
         DemoBackend::repaint_handle(self)
     }
 
+    fn request_refresh(&self) {
+        // 演示后端的下载 / 扫码都是即时状态，不需要额外刷新。
+    }
+
     fn clone_backend(&self) -> Box<dyn GuiBackend> {
         Box::new(Arc::clone(self))
+    }
+}
+
+/// 原地移动一首歌并把当前曲目的索引校正到新位置（与 `QueueService::move_song` 同规则）。
+fn move_track(queue: &mut Vec<TrackView>, current: usize, from: usize, to: usize) -> Option<usize> {
+    if from >= queue.len() || to >= queue.len() || from == to {
+        return None;
+    }
+    let song = queue.remove(from);
+    queue.insert(to, song);
+    let next = if current == from {
+        to
+    } else if from < current && to >= current {
+        current - 1
+    } else if from > current && to <= current {
+        current + 1
+    } else {
+        current
+    };
+    Some(next)
+}
+
+/// 演示歌词：三行 + 第二行逐字 + 当前行译文占位。
+fn demo_lyrics() -> LyricsView {
+    LyricsView {
+        lines: vec![
+            "一群嗜血的蚂蚁 被腐肉所吸引".into(),
+            "我面无表情 看孤独的风景".into(),
+            "失去你 爱恨开始分明".into(),
+        ],
+        current: 1,
+        translation: None,
+        words: vec![
+            LyricWord {
+                text: "我面无表情".into(),
+                start_ms: 4_000,
+                duration_ms: 1_500,
+            },
+            LyricWord {
+                text: " 看孤独的风景".into(),
+                start_ms: 5_500,
+                duration_ms: 1_500,
+            },
+        ],
+    }
+}
+
+/// 演示用的收藏 / 历史 / 歌单数据。
+fn demo_library() -> LibraryView {
+    let track = |id: &str, singer: &str, name: &str, album: &str, duration: u64| TrackView {
+        id: id.into(),
+        source: "demo".into(),
+        name: name.into(),
+        singer: singer.into(),
+        album: album.into(),
+        duration_ms: duration,
+        cover_url: None,
+    };
+    let songs = vec![
+        track("1", "周杰伦", "夜曲", "十一月的萧邦", 226_000),
+        track("2", "周杰伦", "七里香", "七里香", 299_000),
+        track("3", "林俊杰", "晴天", "叶惠美", 269_000),
+    ];
+    LibraryView {
+        favorites: songs.clone(),
+        history: songs.iter().take(2).cloned().collect(),
+        playlists: vec![PlaylistView {
+            id: "demo-1".into(),
+            name: "通勤歌单".into(),
+            song_count: 2,
+            songs: songs.iter().take(2).cloned().collect(),
+        }],
+        selected: None,
+        error: None,
     }
 }
 
@@ -384,6 +510,8 @@ fn send_to(
             state.queue = songs;
             state.snapshot.queue = state.queue.clone();
             start(&mut state.snapshot, song, index);
+            // 真实链路里新曲目的歌词由核心重新加载；演示直接换上示例歌词。
+            state.snapshot.lyrics = demo_lyrics();
         }
         GuiRequest::SetVolume(volume) => {
             state.snapshot.volume = volume.min(100);
@@ -428,6 +556,163 @@ fn send_to(
         }
         GuiRequest::PlaylistEnded => {
             state.snapshot.notification = Some("队列已播完".into());
+        }
+        // P1 的页面在演示后端里用本地示例数据模拟（不访问网络）。
+        GuiRequest::ReorderQueue { from, to } => {
+            // 与核心 `QueueMove` 一致：当前曲目的索引随移动校正。
+            let current = state.snapshot.queue_index;
+            if let Some(index) = move_track(&mut state.snapshot.queue, current, from, to) {
+                state.snapshot.queue_index = index;
+            }
+        }
+        GuiRequest::RefreshLibrary | GuiRequest::OpenPlaylist(_) => {
+            state.snapshot.library = demo_library();
+        }
+        GuiRequest::ToggleFavorite(song) => {
+            let library = state.snapshot.library.clone();
+            let already = library.favorites.iter().any(|item| item.id == song.id);
+            let favorites = if already {
+                library
+                    .favorites
+                    .into_iter()
+                    .filter(|item| item.id != song.id)
+                    .collect()
+            } else {
+                let mut favorites = library.favorites;
+                favorites.insert(0, song);
+                favorites
+            };
+            state.snapshot.library.favorites = favorites;
+        }
+        GuiRequest::AddToPlaylist { playlist, song } => {
+            let mut library = state.snapshot.library.clone();
+            if let Some(target) = library
+                .playlists
+                .iter_mut()
+                .find(|item| item.id == playlist)
+            {
+                target.songs.push(song);
+                target.song_count += 1;
+            }
+            state.snapshot.library = library;
+        }
+        GuiRequest::RemoveFromPlaylist { playlist, song } => {
+            let mut library = state.snapshot.library.clone();
+            if let Some(target) = library
+                .playlists
+                .iter_mut()
+                .find(|item| item.id == playlist)
+            {
+                target.songs.retain(|item| item.id != song.id);
+                target.song_count = target.songs.len() as u32;
+            }
+            state.snapshot.library = library;
+        }
+        GuiRequest::RemoveFromHistory(song) => {
+            state
+                .snapshot
+                .library
+                .history
+                .retain(|item| item.id != song.id);
+        }
+        GuiRequest::CreatePlaylist(name) => {
+            let mut library = state.snapshot.library.clone();
+            let id = format!("demo-{}", library.playlists.len() + 1);
+            library.playlists.push(PlaylistView {
+                id,
+                name,
+                song_count: 0,
+                songs: Vec::new(),
+            });
+            state.snapshot.library = library;
+        }
+        GuiRequest::DeletePlaylist(id) => {
+            state
+                .snapshot
+                .library
+                .playlists
+                .retain(|item| item.id != id);
+        }
+        GuiRequest::RefreshSources => {}
+        GuiRequest::SetDefaultSource(source) => {
+            state.snapshot.sources.default = source;
+        }
+        GuiRequest::ToggleSource(source) => {
+            let sources = &mut state.snapshot.sources;
+            if sources.enabled.contains(&source) {
+                sources.enabled.retain(|item| *item != source);
+            } else {
+                sources.enabled.push(source);
+            }
+        }
+        GuiRequest::StartLogin(source) => {
+            state.snapshot.sources.login = Some(LoginView {
+                source,
+                url: "https://example.com/demo-qr".into(),
+                image_base64: None,
+                status: "waiting".into(),
+                message: "演示模式：请用对应 App 扫码".into(),
+                polling: true,
+            });
+        }
+        GuiRequest::LogoutSource(source) => {
+            state
+                .snapshot
+                .sources
+                .logged_in
+                .retain(|item| *item != source);
+            state.snapshot.sources.login = None;
+        }
+        GuiRequest::ToggleLyric(toggle) => match toggle {
+            LyricToggle::Translation => {
+                // 播放中，翻译始终由核心给出；这里演示「当前行译文」内容。
+                state.snapshot.lyrics.translation = Some("（演示）翻译行".into());
+            }
+            LyricToggle::Yrc => {
+                state.snapshot.lyrics.words = if state.snapshot.lyrics.words.is_empty() {
+                    vec![LyricWord {
+                        text: "演示逐字".into(),
+                        start_ms: 0,
+                        duration_ms: 800,
+                    }]
+                } else {
+                    Vec::new()
+                };
+            }
+        },
+        GuiRequest::DownloadSong(song) => {
+            let downloads = &mut state.snapshot.downloads;
+            let id = downloads.tasks.len() as u64 + 1;
+            downloads.tasks.push(DownloadItemView {
+                id,
+                name: song.name,
+                singer: song.singer,
+                state: "下载中".into(),
+                active: true,
+                can_retry: false,
+                downloaded: 4096,
+                total: 8192,
+                elapsed_ms: 1000,
+                speed_bps: 4096,
+                error: None,
+            });
+            downloads.download_dir = "~/.local/share/voicefox/downloads".into();
+        }
+        GuiRequest::CancelDownload(id) => {
+            if let Some(task) = state
+                .snapshot
+                .downloads
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+            {
+                task.state = "已取消".into();
+                task.active = false;
+                task.can_retry = true;
+            }
+        }
+        GuiRequest::ClearFinishedDownloads => {
+            state.snapshot.downloads.tasks.retain(|task| task.active);
         }
         GuiRequest::Quit => state.closed = true,
     }

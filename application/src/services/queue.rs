@@ -73,6 +73,32 @@ impl QueueService {
         Some(removed)
     }
 
+    /// 原地移动一首歌；返回移动后的索引与是否真的移动了。
+    ///
+    /// 当前曲目的索引随之调整，保证「正在播放的那首」仍然对齐。
+    pub fn move_song(&self, from: usize, to: usize) -> Option<usize> {
+        {
+            let mut songs = self.songs.write().unwrap_or_else(|e| e.into_inner());
+            if from >= songs.len() || to >= songs.len() || from == to {
+                return None;
+            }
+            let song = songs.remove(from);
+            songs.insert(to, song);
+        }
+        let current = self.index.load(Ordering::Acquire);
+        let next = if current == from {
+            to
+        } else if from < current && to >= current {
+            current - 1
+        } else if from > current && to <= current {
+            current + 1
+        } else {
+            current
+        };
+        self.index.store(next, Ordering::Release);
+        Some(next)
+    }
+
     pub fn clear(&self) {
         self.replace(Vec::new(), 0);
     }
@@ -106,6 +132,29 @@ mod tests {
             vec!["a", "b", "c"]
         );
         assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn moving_songs_keeps_current_track_aligned() {
+        let queue = QueueService::new();
+        queue.replace(vec![song("a"), song("b"), song("c")], 1);
+        // 把第 0 首挪到末尾：当前曲目 "b" 前移一位。
+        let index = queue.move_song(0, 2).expect("可以移动");
+        let (songs, _) = queue.snapshot();
+        assert_eq!(
+            songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+        assert_eq!(index, 0);
+        assert_eq!(songs[index].id, "b");
+        // 移动当前曲目本身：索引跟随到新位置。
+        let index = queue.move_song(0, 2).expect("可以移动");
+        let (songs, _) = queue.snapshot();
+        assert_eq!(index, 2);
+        assert_eq!(songs[index].id, "b");
+        // 越界或原地移动不改变任何东西。
+        assert!(queue.move_song(5, 0).is_none());
+        assert!(queue.move_song(1, 1).is_none());
     }
 
     #[test]
