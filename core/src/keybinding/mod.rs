@@ -674,7 +674,73 @@ pub struct KeyBinding {
     pub code: KeyCode,
 }
 
+/// 不依赖终端后端的键位描述：桌面 GUI 用它与 egui 的按键事件比对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyGesture {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// 字符键为 `Some(c)`（已按核心规则大写归一），特殊键为 `None`。
+    pub character: Option<char>,
+    /// 特殊键名（`F5`、`Enter`、`Space`…），字符键为 `None`。
+    pub special: Option<&'static str>,
+}
+
 impl KeyBinding {
+    /// 转换成与后端无关的描述（GUI 侧匹配用）。
+    pub fn gesture(&self) -> KeyGesture {
+        let character = match self.code {
+            KeyCode::Char(character) => Some(character),
+            _ => None,
+        };
+        let special = Some(match self.code {
+            KeyCode::Enter => "Enter",
+            KeyCode::Esc => "Esc",
+            KeyCode::Tab => "Tab",
+            KeyCode::Backspace => "Backspace",
+            KeyCode::Delete => "Delete",
+            KeyCode::Home => "Home",
+            KeyCode::End => "End",
+            KeyCode::PageUp => "PageUp",
+            KeyCode::PageDown => "PageDown",
+            KeyCode::Up => "Up",
+            KeyCode::Down => "Down",
+            KeyCode::Left => "Left",
+            KeyCode::Right => "Right",
+            KeyCode::F(number) => match number {
+                1 => "F1",
+                2 => "F2",
+                3 => "F3",
+                4 => "F4",
+                5 => "F5",
+                6 => "F6",
+                7 => "F7",
+                8 => "F8",
+                9 => "F9",
+                10 => "F10",
+                11 => "F11",
+                12 => "F12",
+                _ => "F",
+            },
+            _ => {
+                return KeyGesture {
+                    ctrl: self.modifiers.contains(KeyModifiers::CONTROL),
+                    alt: self.modifiers.contains(KeyModifiers::ALT),
+                    shift: self.modifiers.contains(KeyModifiers::SHIFT),
+                    character,
+                    special: None,
+                };
+            }
+        });
+        KeyGesture {
+            ctrl: self.modifiers.contains(KeyModifiers::CONTROL),
+            alt: self.modifiers.contains(KeyModifiers::ALT),
+            shift: self.modifiers.contains(KeyModifiers::SHIFT),
+            character,
+            special,
+        }
+    }
+
     /// 从 `KeyEvent` 创建
     pub fn from_event(event: KeyEvent) -> Self {
         normalize_char_binding(event.modifiers, event.code)

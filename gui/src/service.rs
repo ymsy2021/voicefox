@@ -17,8 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use lx_core::model::config::Config;
+use lx_core::keybinding::{Action, parse_keybinding};
+use lx_core::model::config::{Appearance, Config};
 use lx_core::model::song::SongInfo;
+use lx_core::model::source::Quality;
 use lx_core::model::source::{PlayerState, SourceId};
 use lx_core::traits::player::PlayerBackend;
 use lx_source::manager::SourceManager;
@@ -30,6 +32,7 @@ use voicefox_runtime::ApplicationRuntime;
 use voicefox_runtime::download::DownloadManager;
 use voicefox_runtime::media::{self, MediaSession, PlayMode};
 use voicefox_runtime::storage::Storage;
+use voicefox_runtime::ui::theme::{skin_label, skin_names};
 
 /// 服务层的错误：只保留面向用户的文案。
 #[derive(Debug, Clone)]
@@ -188,6 +191,27 @@ pub struct DownloadsView {
     pub download_dir: String,
 }
 
+/// 设置页的数据：全部来自已有的 `Config`，没有 GUI 专属配置。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SettingsView {
+    pub quality: String,
+    pub download_quality: String,
+    pub volume: u32,
+    pub enabled_sources: Vec<String>,
+    pub default_source: String,
+    /// 具名主题（含 `voicefox`）与显示名。
+    pub themes: Vec<(String, String)>,
+    pub theme: String,
+    /// 覆盖 `[theme]` 的显示模式：`system` / `light` / `dark`。
+    pub appearance: String,
+    /// 仍然生效的外观（实际用来取色的主题与明暗）。
+    pub effective_theme: String,
+    pub effective_dark: bool,
+    /// 播放 / 暂停等全局键位：动作 → 键位字符串。
+    pub global_keys: Vec<(String, String)>,
+    pub error: Option<String>,
+}
+
 /// 一条下载任务。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DownloadItemView {
@@ -214,7 +238,7 @@ impl DownloadItemView {
 }
 
 /// 一帧的完整界面状态。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     pub state: PlaybackState,
     pub song: Option<TrackView>,
@@ -233,6 +257,39 @@ pub struct Snapshot {
     pub library: LibraryView,
     pub sources: SourcesView,
     pub downloads: DownloadsView,
+    pub settings: SettingsView,
+    /// 当前配置（供 UI 读取外观等设置；同样由服务线程发布，UI 只读）。
+    ///
+    /// 用序列化文本参与 `PartialEq`：配置结构体没有实现 `PartialEq`，
+    /// 而快照比较只需要「配置有没有变」。
+    pub config: Config,
+    /// `config` 的序列化文本，仅用于快照相等性比较（不参与渲染）。
+    config_key: String,
+}
+
+/// 逐字段比较：`config` 用序列化文本代替（配置结构体未实现 `PartialEq`），
+/// 避免为整个配置树加 derive，也避免发布快照时空比较。
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.state == other.state
+            && self.song == other.song
+            && self.position == other.position
+            && self.duration == other.duration
+            && self.volume == other.volume
+            && self.play_mode == other.play_mode
+            && self.queue == other.queue
+            && self.queue_index == other.queue_index
+            && self.search == other.search
+            && self.lyrics == other.lyrics
+            && self.notification == other.notification
+            && self.has_media_controls == other.has_media_controls
+            && self.playlist_ended == other.playlist_ended
+            && self.library == other.library
+            && self.sources == other.sources
+            && self.downloads == other.downloads
+            && self.settings == other.settings
+            && self.config_key == other.config_key
+    }
 }
 
 impl Default for Snapshot {
@@ -255,6 +312,9 @@ impl Default for Snapshot {
             library: LibraryView::default(),
             sources: SourcesView::default(),
             downloads: DownloadsView::default(),
+            settings: SettingsView::default(),
+            config: Config::default(),
+            config_key: String::new(),
         }
     }
 }
@@ -361,10 +421,32 @@ pub enum GuiRequest {
         playlist: String,
         song: TrackView,
     },
+    /// 设置页：刷新、改音质 / 音量 / 主题 / 外观 / 键位。
+    RefreshSettings,
+    /// UI 每帧报告桌面深浅色（来自 egui 的系统主题通道）。
+    ReportAppearance {
+        dark: bool,
+    },
+    SetQuality(String),
+    SetDownloadQuality(String),
+    SetVolumeSetting(u32),
+    SetTheme(String),
+    /// 显示模式：`system` / `light` / `dark`。
+    SetAppearance(String),
+    SetKeybinding {
+        action: String,
+        keys: String,
+    },
+    /// 请求 UI 打开设置页页签（托盘菜单用）。
+    ShowSettings,
     /// 下载：入队当前曲目 / 搜索结果里的一首，取消、清理已结束。
     DownloadSong(TrackView),
     CancelDownload(u64),
     ClearFinishedDownloads,
+    /// 启动系统托盘（托盘线程直接向服务线程发播放请求）。
+    StartTray {
+        show_settings: Arc<std::sync::atomic::AtomicBool>,
+    },
     /// 从桌面控件退出（MPRIS Quit / 窗口关闭）。
     Quit,
 }
@@ -563,6 +645,7 @@ pub fn spawn(runtime: ApplicationRuntime, startup: Vec<GuiRequest>) -> AppServic
     let wake = RepaintHandle::default();
     let refresh = RefreshHandle::default();
     let refresh_for_bridge = refresh.clone();
+    let requests_tx_for_bridge = requests_tx.clone();
     for request in startup {
         let _ = requests_tx.send(request);
     }
@@ -589,6 +672,7 @@ pub fn spawn(runtime: ApplicationRuntime, startup: Vec<GuiRequest>) -> AppServic
                 requests_rx,
                 wake,
                 refresh_for_bridge,
+                requests_tx_for_bridge,
             ));
         })
         .expect("spawn backend thread");
@@ -633,6 +717,12 @@ struct Bridge {
     /// 当前配置（音源开关、歌词开关的判断依据，服务线程自己维护）。
     config_snapshot: Option<Config>,
     lyric_service: Option<Arc<lx_lyric::service::LyricService>>,
+    /// 设置页视图：每次读当前配置生成，不在 UI 线程解析配置。
+    settings_view: SettingsView,
+    /// 桌面报告的系统深浅色（`Context::system_theme`，服务线程按需刷新）。
+    appearance_dark: Option<bool>,
+    /// 托盘动作直接投递请求的通道（与 UI 共用同一个队列，保证顺序）。
+    tray_sender: mpsc::UnboundedSender<GuiRequest>,
 }
 
 impl Bridge {
@@ -846,6 +936,38 @@ impl Bridge {
                 );
                 self.move_queue(from, to);
             }
+            GuiRequest::RefreshSettings => self.refresh_settings(),
+            GuiRequest::ReportAppearance { dark } => {
+                if self.appearance_dark != Some(dark) {
+                    self.appearance_dark = Some(dark);
+                    self.refresh_settings();
+                }
+            }
+            GuiRequest::SetQuality(quality) => self.send_config(ConfigChange::Quality(quality)),
+            GuiRequest::SetDownloadQuality(quality) => {
+                self.send_config(ConfigChange::DownloadQuality(quality));
+            }
+            GuiRequest::SetVolumeSetting(volume) => {
+                let volume = volume.min(100);
+                self.player.set_volume(volume);
+                let mut session = self.media.lock().unwrap_or_else(|e| e.into_inner());
+                session.set_play_mode(self.play_mode);
+                session.tick();
+                drop(session);
+                self.volume = volume;
+                self.send_config(ConfigChange::Volume(volume));
+            }
+            GuiRequest::SetTheme(theme) => self.send_config(ConfigChange::Theme(theme)),
+            GuiRequest::SetAppearance(mode) => {
+                self.send_config(ConfigChange::Appearance(mode));
+            }
+            GuiRequest::SetKeybinding { action, keys } => {
+                self.send_config(ConfigChange::Keybinding { action, keys });
+            }
+            GuiRequest::ShowSettings => {
+                // 打开设置页由 UI 侧决定（控制器只负责状态栏提示）。
+                self.notification = Some("设置".into());
+            }
             GuiRequest::RefreshLibrary => self.refresh_library(None),
             GuiRequest::OpenPlaylist(id) => self.refresh_library(Some(&id)),
             GuiRequest::RefreshSources => self.refresh_sources(),
@@ -874,6 +996,16 @@ impl Bridge {
                     downloads.clear_finished();
                 }
                 self.refresh_downloads();
+            }
+            GuiRequest::StartTray { show_settings } => {
+                let send = {
+                    let sender = self.tray_sender.clone();
+                    move |request: GuiRequest| sender.send(request).is_ok()
+                };
+                let started =
+                    crate::tray::start(send, crate::tray::WindowCommands::new(show_settings));
+                TRAY_ACTIVE.store(started, Ordering::Release);
+                debug_log(&format!("tray started: {started}"));
             }
             GuiRequest::Quit => return true,
         }
@@ -1141,6 +1273,60 @@ impl Bridge {
         });
     }
 
+    // ── 设置 ──
+
+    /// 设置页视图：全部字段取自当前 `Config`（不做界面专属配置）。
+    fn refresh_settings(&mut self) {
+        let Some(config) = self.parsed_config() else {
+            return;
+        };
+        let dark = self
+            .appearance_dark
+            .unwrap_or(config.ui.appearance != lx_core::model::config::Appearance::Light);
+        let effective_theme = voicefox_runtime::ui::theme::resolve_theme_name(&config.theme, dark);
+        let mut global_keys: Vec<(String, String)> = config
+            .keybindings
+            .global
+            .iter()
+            .map(|(action, keys)| (format!("{action:?}"), keys.clone()))
+            .collect();
+        global_keys.sort();
+        let themes = skin_names()
+            .into_iter()
+            .map(|name| {
+                let label = skin_label(&name);
+                (name, label)
+            })
+            .collect();
+        self.settings_view = SettingsView {
+            quality: quality_from_config(config.player.quality),
+            download_quality: config
+                .download
+                .quality
+                .map(quality_from_config)
+                .unwrap_or_else(|| "follow".to_string()),
+            volume: config.player.volume.min(100),
+            enabled_sources: config
+                .source
+                .enabled
+                .iter()
+                .map(|source| source.as_str().to_string())
+                .collect(),
+            default_source: config.source.default.as_str().to_string(),
+            themes,
+            theme: if config.theme.name.trim().is_empty() {
+                "voicefox".to_string()
+            } else {
+                config.theme.name.clone()
+            },
+            appearance: config.ui.appearance.as_str().to_string(),
+            effective_theme,
+            effective_dark: dark,
+            global_keys,
+            error: None,
+        };
+    }
+
     // ── 歌词显示开关 ──
 
     fn toggle_lyric(&mut self, toggle: LyricToggle) {
@@ -1294,6 +1480,13 @@ impl Bridge {
             library: self.library.clone(),
             sources: self.sources_view.clone(),
             downloads: self.downloads_view.clone(),
+            settings: self.settings_view.clone(),
+            config: self.config_snapshot.clone().unwrap_or_default(),
+            config_key: self
+                .config_snapshot
+                .as_ref()
+                .map(|config| toml::to_string(config).unwrap_or_default())
+                .unwrap_or_default(),
         }
     }
 
@@ -1443,8 +1636,10 @@ async fn run_bridge(
     requests: mpsc::UnboundedReceiver<GuiRequest>,
     wake: RepaintHandle,
     refresh: RefreshHandle,
+    requests_sender: mpsc::UnboundedSender<GuiRequest>,
 ) {
     let (config_tx, mut config_rx) = mpsc::unbounded_channel::<ConfigChange>();
+    let tray_sender = requests_sender;
     let mode = {
         let session = runtime.media();
         let guard = session.lock().unwrap_or_else(|e| e.into_inner());
@@ -1485,10 +1680,14 @@ async fn run_bridge(
         config_tx,
         config_snapshot: Some(config_snapshot),
         lyric_service: Some(runtime.lyrics()),
+        settings_view: SettingsView::default(),
+        appearance_dark: None,
+        tray_sender,
     };
     bridge.refresh_from_application();
     bridge.refresh_library(None);
     bridge.refresh_sources();
+    bridge.refresh_settings();
     bridge.refresh_downloads();
 
     let mut events = application.subscribe();
@@ -1514,6 +1713,7 @@ async fn run_bridge(
                     }
                     Err(error) => bridge.notification = Some(error),
                 }
+                bridge.refresh_settings();
                 force_publish = true;
             }
             _ = refresh.notified() => {
@@ -1764,6 +1964,12 @@ pub enum ConfigChange {
     ToggleSource(String),
     LyricTranslation(bool),
     LyricYrc(bool),
+    Quality(String),
+    DownloadQuality(String),
+    Volume(u32),
+    Theme(String),
+    Appearance(String),
+    Keybinding { action: String, keys: String },
 }
 
 /// 把 `ConfigChange` 应用到运行时配置：返回给用户看的说明。
@@ -1800,9 +2006,129 @@ pub fn apply_config_change(
             config.lyric.show_yrc = *enabled;
             message = format!("逐字歌词: {}", if *enabled { "开" } else { "关" });
         }
+        ConfigChange::Quality(quality) => {
+            if let Some(value) = quality_from_str(quality) {
+                config.player.quality = value;
+                message = format!("播放音质: {}", quality_from_config(value));
+            }
+        }
+        ConfigChange::DownloadQuality(quality) => {
+            // 空串 = 跟随播放音质（`download.quality = null`）。
+            if quality.trim().is_empty() || quality.eq_ignore_ascii_case("follow") {
+                config.download.quality = None;
+                message = "下载音质: 跟随播放".into();
+            } else if let Some(value) = quality_from_str(quality) {
+                config.download.quality = Some(value);
+                message = format!("下载音质: {}", quality_from_config(value));
+            }
+        }
+        ConfigChange::Volume(volume) => {
+            config.player.volume = (*volume).min(100);
+            message = format!("音量: {}", config.player.volume);
+        }
+        ConfigChange::Theme(theme) => {
+            let theme = theme.trim();
+            if theme == "voicefox" || skin_names().iter().any(|name| name == theme) {
+                config.theme.name = theme.to_string();
+                message = format!("主题: {}", skin_label(theme));
+            }
+        }
+        ConfigChange::Appearance(mode) => {
+            // 非 `system` 时把选择落到 `[ui].appearance`，与 TUI 共用同一份配置。
+            let value = Appearance::parse(mode);
+            config.ui.appearance = value;
+            message = format!("外观: {}", value.label());
+        }
+        ConfigChange::Keybinding { action, keys } => match parse_action(action) {
+            Some(action) => {
+                let keys = keys.trim();
+                if keys.is_empty() {
+                    message = "键位不能为空".into();
+                } else if let Err(error) = validate_keys(keys) {
+                    message = format!("键位「{keys}」无效：{error}");
+                } else {
+                    config.keybindings.global.insert(action, keys.to_string());
+                    message = format!("{} → {keys}", action.label());
+                }
+            }
+            None => message = format!("未知动作: {action}"),
+        },
     })?;
     runtime.apply_source_preferences();
     Ok(message)
+}
+
+/// 音质 → 配置里的名字（`128k` / `320k` / `flac` / `flac24bit`）。
+pub fn quality_from_config(quality: Quality) -> String {
+    match quality {
+        Quality::Low128 => "128k",
+        Quality::High320 => "320k",
+        Quality::Flac => "flac",
+        Quality::Flac24 => "flac24bit",
+    }
+    .to_string()
+}
+
+/// 配置名 → 音质；非法值返回 `None`（菜单里不出现这些值）。
+pub fn quality_from_str(value: &str) -> Option<Quality> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "128k" | "low" => Some(Quality::Low128),
+        "320k" | "high" => Some(Quality::High320),
+        "flac" | "lossless" => Some(Quality::Flac),
+        "flac24bit" | "hires" => Some(Quality::Flac24),
+        _ => None,
+    }
+}
+
+/// 设置页列出的音质选项（显示顺序即降序）。
+pub const QUALITY_OPTIONS: [(&str, &str); 4] = [
+    ("128k", "128k"),
+    ("320k", "320k"),
+    ("flac", "FLAC"),
+    ("flac24bit", "FLAC 24bit"),
+];
+
+/// 键位动作名 → 动作（只接受全局动作：GUI 侧兑现的子集全在这里）。
+pub fn parse_action(name: &str) -> Option<Action> {
+    let name = name.trim();
+    // 快照里存的是 `Debug` 名（`GlobalPlayPause`）；也接受配置里的
+    // snake_case（`global_play_pause`），两种写法都落到同一个动作。
+    GUI_ACTIONS.into_iter().find(|action| {
+        format!("{action:?}").eq_ignore_ascii_case(name)
+            || format!("{action:?}").chars().enumerate().fold(
+                String::new(),
+                |mut out, (index, ch)| {
+                    if ch.is_ascii_uppercase() && index > 0 {
+                        out.push('_');
+                    }
+                    out.push(ch.to_ascii_lowercase());
+                    out
+                },
+            ) == name.to_ascii_lowercase()
+    })
+}
+
+/// GUI 设置页可编辑的全局动作（播放控制等 TUI 也在用的同一批键位）。
+pub const GUI_ACTIONS: [Action; 4] = [
+    Action::GlobalPlayPause,
+    Action::GlobalNextTrack,
+    Action::GlobalPrevTrack,
+    Action::SearchInputMode,
+];
+
+/// 键位字符串校验：必须能被核心解析器接受（与 TUI 同一套语法）。
+pub fn validate_keys(keys: &str) -> Result<(), String> {
+    match parse_keybinding(keys) {
+        Some(_) => Ok(()),
+        None => Err("无法识别的键位（例如 Ctrl+l、Space、F5）".to_string()),
+    }
+}
+
+/// 托盘是否已注册（服务线程启动托盘后写入，UI 按它决定关闭行为）。
+static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn tray_active() -> bool {
+    TRAY_ACTIVE.load(Ordering::Acquire)
 }
 
 /// 音源配置文本里的名字 → [`SourceId`]（只接受内置在线音源）。

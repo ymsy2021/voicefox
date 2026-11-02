@@ -16,6 +16,7 @@ use crate::theme::GuiTheme;
 
 mod downloads;
 mod library;
+mod settings;
 mod sources;
 
 use library::thumbnail;
@@ -31,6 +32,7 @@ pub enum Tab {
     Library,
     Sources,
     Downloads,
+    Settings,
 }
 
 impl Tab {
@@ -42,16 +44,18 @@ impl Tab {
             Self::Library => "收藏",
             Self::Sources => "音源",
             Self::Downloads => "下载",
+            Self::Settings => "设置",
         }
     }
 
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Search,
         Tab::Queue,
         Tab::Lyrics,
         Tab::Library,
         Tab::Sources,
         Tab::Downloads,
+        Tab::Settings,
     ];
 }
 
@@ -174,6 +178,7 @@ impl UiState {
                 Tab::Library => self.library_panel(ui, controller, &snapshot, theme),
                 Tab::Sources => self.sources_panel(ui, controller, &snapshot, theme),
                 Tab::Downloads => self.downloads_panel(ui, controller, &snapshot, theme),
+                Tab::Settings => self.settings_panel(ui, controller, &snapshot, theme),
             });
 
         egui::CentralPanel::default()
@@ -1060,7 +1065,8 @@ mod tests {
 
     #[test]
     fn p1_tabs_and_labels_are_visible() {
-        assert_eq!(Tab::ALL.len(), 6);
+        assert_eq!(Tab::ALL.len(), 7);
+        assert_eq!(Tab::Settings.label(), "设置");
         assert_eq!(Tab::Library.label(), "收藏");
         assert_eq!(Tab::Sources.label(), "音源");
         assert_eq!(Tab::Downloads.label(), "下载");

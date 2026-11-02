@@ -5,7 +5,7 @@
 
 use eframe::egui::{Color32, CornerRadius, Stroke, Visuals};
 use lx_core::model::config::Config;
-use voicefox_runtime::ui::theme::Palette;
+use voicefox_runtime::ui::theme::{Palette, palette_for_config};
 
 fn color(rgb: [u8; 3]) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
@@ -32,9 +32,16 @@ pub struct GuiTheme {
 }
 
 impl GuiTheme {
+    /// 按配置取色（`[theme]` 具名主题或手工槽位）。
     pub fn from_config(config: &Config) -> Self {
         let palette = Palette::from_config(&config.theme);
         Self::from_palette(&palette)
+    }
+
+    /// 按明暗取色：深色直接用配置；浅色换到同色相的浅色变体（`voicefox`
+    /// 槽位则反转层次），保证两种外观下都读得清。
+    pub fn for_appearance(config: &Config, dark: bool) -> Self {
+        Self::from_palette(&palette_for_config(&config.theme, dark))
     }
 
     pub fn from_palette(palette: &Palette) -> Self {
@@ -57,9 +64,19 @@ impl GuiTheme {
         }
     }
 
-    /// 应用到 egui 的深色视觉风格。
+    /// 应用到 egui 的深色视觉风格（浅色外观用 [`Self::visuals_with`]）。
     pub fn visuals(self) -> Visuals {
-        let mut visuals = Visuals::dark();
+        self.visuals_with(true)
+    }
+
+    /// 按明暗生成视觉风格：浅色时以 `Visuals::light()` 为底再套同一套主题色，
+    /// 否则滚动条、窗口阴影等未显式覆盖的部件仍是深色。
+    pub fn visuals_with(self, dark: bool) -> Visuals {
+        let mut visuals = if dark {
+            Visuals::dark()
+        } else {
+            Visuals::light()
+        };
         visuals.panel_fill = self.base;
         visuals.window_fill = self.base;
         visuals.extreme_bg_color = self.mantle;
@@ -122,6 +139,36 @@ mod tests {
         };
         let theme = GuiTheme::from_config(&nord);
         assert_ne!(theme.base.to_array(), [30, 30, 46, 255]);
+    }
+
+    #[test]
+    fn light_appearance_flips_the_voicefox_slots() {
+        let config = Config::default();
+        let dark = GuiTheme::for_appearance(&config, true);
+        let light = GuiTheme::for_appearance(&config, false);
+        assert_eq!(dark.base.to_array(), [30, 30, 46, 255]);
+        // 浅色下背景变亮、正文变暗：明暗确实反转了。
+        assert!(light.base.r() > 200, "浅色背景应接近白色");
+        assert!(light.text.r() < 80, "浅色正文应接近黑色");
+        assert_ne!(light.accent, dark.accent, "强调色在浅色下要与之区分");
+        assert!(light.visuals_with(false).panel_fill == light.base);
+        assert!(!light.visuals_with(false).dark_mode);
+        assert!(dark.visuals_with(true).dark_mode);
+    }
+
+    #[test]
+    fn named_theme_switches_to_its_light_variant() {
+        let config = Config {
+            theme: lx_core::model::config::ThemeConfig {
+                name: "catppuccin-mocha".into(),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let light = GuiTheme::for_appearance(&config, false);
+        let dark = GuiTheme::for_appearance(&config, true);
+        assert_ne!(light.base, dark.base, "latte 与 mocha 背景不同");
+        assert!(light.base.r() > dark.base.r(), "latte 比 mocha 亮");
     }
 
     #[test]

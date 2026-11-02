@@ -137,6 +137,31 @@ fn steps() -> Vec<Step> {
             absent: &[],
         },
         Step {
+            name: "settings",
+            run: Box::new(|stage: &mut Stage| {
+                stage.ui.tab = Tab::Settings;
+                stage.send(GuiRequest::RefreshSettings);
+            }),
+            expect: &[
+                "设置",
+                "音质",
+                "音量",
+                "下载音质",
+                "外观",
+                "深浅色",
+                "快捷键",
+            ],
+            absent: &[],
+        },
+        Step {
+            name: "settings-light",
+            run: Box::new(|stage: &mut Stage| {
+                stage.send(GuiRequest::SetAppearance("light".into()));
+            }),
+            expect: &["强制浅色"],
+            absent: &[],
+        },
+        Step {
             name: "downloads",
             run: Box::new(|stage: &mut Stage| {
                 stage.ui.tab = Tab::Downloads;

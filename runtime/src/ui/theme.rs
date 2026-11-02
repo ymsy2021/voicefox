@@ -230,6 +230,111 @@ impl Palette {
     }
 }
 
+/// `[theme].name` 在主题库里的映射方式。
+///
+/// 主题库的名字带明暗后缀（`catppuccin-mocha` / `catppuccin-latte`、
+/// `dracula` / `dracula-light`…）。桌面 GUI 跟随系统深浅色时，只换后缀、
+/// 保留同一套色相，用户选的主题仍然被尊重。
+pub fn resolve_theme_name(theme: &ThemeConfig, dark: bool) -> String {
+    let current = match library_theme(&theme.name) {
+        Some(theme) => theme,
+        // `voicefox` 或未知名字：用主题库的默认深/浅主题兜底。
+        None => {
+            return if dark {
+                SKIN_VOICEFOX.to_string()
+            } else {
+                "catppuccin-latte".to_string()
+            };
+        }
+    };
+    let wanted = |hint: &str| -> Option<ThemeName> {
+        ThemeName::all()
+            .iter()
+            .copied()
+            .find(|name| skin_key(*name).contains(hint))
+    };
+    let current_key = skin_key(current);
+    let is_light = current_key.contains("latte") || current_key.contains("light");
+    if is_light == !dark {
+        return current_key;
+    }
+    // 反向后缀优先；否则换到任意同明暗的主题，保证不会给出对不上的明暗。
+    let hints: [&str; 2] = if dark {
+        ["mocha", "dark"]
+    } else {
+        ["latte", "light"]
+    };
+    hints
+        .iter()
+        .find_map(|hint| wanted(hint))
+        .map(skin_key)
+        .unwrap_or(current_key)
+}
+
+/// 按明暗取色：具名主题换到同色相的对应变体，`voicefox` 槽位在浅色时反转
+/// 层次与前景色（配置里的槽位按深色调的，浅色下原样用会读不清）。
+pub fn palette_for_config(theme: &ThemeConfig, dark: bool) -> Palette {
+    if dark {
+        return Palette::from_config(theme);
+    }
+    let resolved = ThemeConfig {
+        name: resolve_theme_name(theme, false),
+        ..theme.clone()
+    };
+    if library_theme(&resolved.name).is_some() {
+        return Palette::from_config(&resolved);
+    }
+    // `voicefox` 槽位：背景/层次色换成浅色，正文与辅助色取深色版的反向槽位。
+    let mut light = theme.clone();
+    let swap = |light: &mut ThemeConfig, theme: &ThemeConfig| {
+        light.base = rgb_hex(parse(&theme.text, TEXT));
+        light.mantle = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.06,
+        ));
+        light.crust = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.12,
+        ));
+        light.surface_0 = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.10,
+        ));
+        light.surface_1 = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.16,
+        ));
+        light.surface_2 = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.24,
+        ));
+        light.text = rgb_hex(parse(&theme.base, BASE));
+        light.subtext_1 = rgb_hex(parse(&theme.subtext_1, SUBTEXT_1));
+        light.subtext_0 = rgb_hex(parse(&theme.subtext_0, SUBTEXT_0));
+        light.muted = rgb_hex(blend_rgb(
+            parse(&theme.base, BASE),
+            parse(&theme.muted, SUBTEXT_0),
+            0.55,
+        ));
+        light.border = rgb_hex(blend_rgb(
+            parse(&theme.text, TEXT),
+            parse(&theme.base, BASE),
+            0.28,
+        ));
+    };
+    swap(&mut light, theme);
+    Palette::from_config(&light)
+}
+
+fn rgb_hex(rgb: Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
 /// 解析一个槽位的颜色（不含封面混合）。
 pub fn slot_from_config(config: &ThemeConfig, slot: &str) -> Option<Rgb> {
     let value = match slot {

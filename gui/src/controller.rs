@@ -153,6 +153,21 @@ impl VoicefoxGuiController {
             .ok();
     }
 
+    /// 当前配置快照（服务线程发布，UI 只读）。
+    pub fn config(&self) -> &lx_core::model::config::Config {
+        &self.snapshot.config
+    }
+
+    /// 某个全局动作当前的键位字符串（没有绑定返回 `None`）。
+    pub fn keybinding(&self, action: lx_core::keybinding::Action) -> Option<String> {
+        self.snapshot
+            .settings
+            .global_keys
+            .iter()
+            .find(|(name, _)| name == &format!("{action:?}"))
+            .map(|(_, keys)| keys.clone())
+    }
+
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }

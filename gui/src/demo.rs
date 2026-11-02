@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use crate::service::{
     DownloadItemView, GuiBackend, GuiError, GuiRequest, LibraryView, LoginView, LyricToggle,
-    LyricWord, LyricsView, PlaybackState, PlaylistView, RepaintHandle, SearchView, Snapshot,
-    SourcesView, TrackView,
+    LyricWord, LyricsView, PlaybackState, PlaylistView, RepaintHandle, SearchView, SettingsView,
+    Snapshot, SourcesView, TrackView,
 };
+use lx_core::model::config::Config;
 use voicefox_runtime::media::PlayMode;
 
 /// 演示曲目（用于搜索结果的种子数据）。
@@ -319,6 +320,37 @@ fn move_track(queue: &mut Vec<TrackView>, current: usize, from: usize, to: usize
 }
 
 /// 演示歌词：三行 + 第二行逐字 + 当前行译文占位。
+/// 演示设置页：按默认配置生成（与服务线程同一份字段）。
+fn demo_settings(config: &Config, dark: bool) -> SettingsView {
+    use crate::service::{QUALITY_OPTIONS, quality_from_config};
+    let _ = QUALITY_OPTIONS;
+    SettingsView {
+        quality: quality_from_config(config.player.quality),
+        download_quality: "follow".into(),
+        volume: config.player.volume,
+        enabled_sources: config
+            .source
+            .enabled
+            .iter()
+            .map(|source| source.as_str().to_string())
+            .collect(),
+        default_source: config.source.default.as_str().to_string(),
+        themes: voicefox_runtime::ui::theme::skin_names()
+            .into_iter()
+            .map(|name| {
+                let label = voicefox_runtime::ui::theme::skin_label(&name);
+                (name, label)
+            })
+            .collect(),
+        theme: config.theme.name.clone(),
+        appearance: config.ui.appearance.as_str().to_string(),
+        effective_theme: config.theme.name.clone(),
+        effective_dark: dark,
+        global_keys: Vec::new(),
+        error: None,
+    }
+}
+
 fn demo_lyrics() -> LyricsView {
     LyricsView {
         lines: vec![
@@ -634,6 +666,51 @@ fn send_to(
                 .retain(|item| item.id != id);
         }
         GuiRequest::RefreshSources => {}
+        GuiRequest::RefreshSettings | GuiRequest::ReportAppearance { .. } => {
+            let config = Config::default();
+            state.snapshot.settings = demo_settings(&config, false);
+            state.snapshot.settings.global_keys = vec![
+                ("GlobalPlayPause".into(), "Space".into()),
+                ("GlobalNextTrack".into(), "n".into()),
+                ("GlobalPrevTrack".into(), "p".into()),
+                ("SearchInputMode".into(), "/".into()),
+            ];
+        }
+        GuiRequest::SetQuality(quality) => {
+            state.snapshot.settings.quality = quality;
+        }
+        GuiRequest::SetDownloadQuality(quality) => {
+            state.snapshot.settings.download_quality = quality;
+        }
+        GuiRequest::SetVolumeSetting(volume) => {
+            state.snapshot.settings.volume = volume.min(100);
+            state.snapshot.volume = volume.min(100);
+        }
+        GuiRequest::SetTheme(theme) => {
+            state.snapshot.settings.theme = theme.clone();
+            state.snapshot.settings.effective_theme = theme;
+        }
+        GuiRequest::SetAppearance(mode) => {
+            state.snapshot.settings.appearance = mode.clone();
+            state.snapshot.settings.effective_dark = mode != "light";
+        }
+        GuiRequest::SetKeybinding { action, keys } => {
+            if let Some(entry) = state
+                .snapshot
+                .settings
+                .global_keys
+                .iter_mut()
+                .find(|(name, _)| *name == action)
+            {
+                entry.1 = keys;
+            }
+        }
+        GuiRequest::StartTray { .. } => {
+            // 演示后端不注册托盘（测试环境没有 D-Bus 会话）。
+        }
+        GuiRequest::ShowSettings => {
+            state.snapshot.notification = Some("设置".into());
+        }
         GuiRequest::SetDefaultSource(source) => {
             state.snapshot.sources.default = source;
         }

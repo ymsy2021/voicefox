@@ -10,9 +10,10 @@ pub mod cover;
 pub mod demo;
 pub mod service;
 pub mod theme;
+pub mod tray;
 pub mod ui;
 
-pub use app::{install_cjk_font, run};
+pub use app::{install_cjk_font, resolve_dark, run};
 pub use controller::VoicefoxGuiController;
 pub use service::{
     AppService, GuiBackend, GuiError, GuiRequest, PlaybackState, RepaintHandle, SearchView,

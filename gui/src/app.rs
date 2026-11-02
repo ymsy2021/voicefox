@@ -12,8 +12,9 @@ use voicefox_runtime::{ApplicationRuntime, CoverService};
 
 use crate::controller::VoicefoxGuiController;
 use crate::cover::{CoverLoader, CoverResults, RuntimeCoverLoader};
-use crate::service::{self, AppService, Snapshot};
+use crate::service::{self, AppService, GuiRequest, Snapshot};
 use crate::theme::GuiTheme;
+use crate::tray::WindowCommands;
 use crate::ui::UiState;
 
 /// 窗口创建失败（无显示服务等）时的可读错误。
@@ -54,6 +55,19 @@ pub fn run(config: Config, runtime: ApplicationRuntime) -> anyhow::Result<()> {
             },
         ));
     }
+    // 托盘「设置」菜单项：只置一个标志，由 UI 线程切页签（托盘线程不碰 UI）。
+    let show_settings = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 托盘在服务线程里建：要 D-Bus 连接与配置写盘，UI 线程不做 IO。
+    let window_commands = WindowCommands::new(Arc::clone(&show_settings));
+    let mut initial_tab: Option<crate::ui::Tab> = None;
+    startup.push(service::GuiRequest::StartTray { show_settings });
+    // 验收钩子：`VOICEFOX_GUI_TAB=settings` 让窗口直接停在某一页（截图用）。
+    if let Ok(tab) = std::env::var("VOICEFOX_GUI_TAB") {
+        startup.push(service::GuiRequest::RefreshSettings);
+        if tab.eq_ignore_ascii_case("settings") {
+            initial_tab = Some(crate::ui::Tab::Settings);
+        }
+    }
     let service = service::spawn(runtime, startup);
     let cover_runtime = cover_runtime();
     let exit = service.clone();
@@ -75,6 +89,16 @@ pub fn run(config: Config, runtime: ApplicationRuntime) -> anyhow::Result<()> {
         cover_results: Arc::new(std::sync::Mutex::new(Vec::new())),
         ui: UiState::default(),
         theme: GuiTheme::from_config(&config),
+        resolved: (
+            GuiTheme::from_config(&config),
+            true,
+            config.ui.appearance,
+            config.theme.name.clone(),
+        ),
+        reported_dark: None,
+        window_commands,
+        initial_tab,
+        tray_active: false,
         #[cfg(not(target_arch = "wasm32"))]
         capture: capture::CaptureState::default(),
     };
@@ -89,6 +113,17 @@ pub fn run(config: Config, runtime: ApplicationRuntime) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 桌面实际呈现的深浅色：`[ui].appearance` 强制时以配置为准，
+/// 「跟随系统」时读 egui 的系统主题通道（eframe 的 glow 后端每帧填充）。
+///
+/// 读不到系统主题（无桌面、Wayland 未上报）时按深色处理，
+/// 与历史版本观感一致。
+pub fn resolve_dark(forced: lx_core::model::config::Appearance, ctx: &egui::Context) -> bool {
+    forced
+        .forced_dark()
+        .unwrap_or_else(|| !matches!(ctx.system_theme(), Some(egui::Theme::Light)))
+}
+
 struct VoicefoxGuiApp {
     controller: Option<VoicefoxGuiController>,
     service: AppService,
@@ -100,6 +135,16 @@ struct VoicefoxGuiApp {
     cover_results: CoverResults,
     ui: UiState,
     theme: GuiTheme,
+    /// 当前生效的配色（明暗 + 具名主题），变化时重算。
+    resolved: (GuiTheme, bool, lx_core::model::config::Appearance, String),
+    /// 上一次报告的桌面深浅色：只在变化时通知服务线程。
+    reported_dark: Option<bool>,
+    /// 托盘请求的窗口命令（显示 / 隐藏、退出、打开设置），每帧消费。
+    window_commands: WindowCommands,
+    /// 启动时要停在哪一页（`VOICEFOX_GUI_TAB` 验收钩子）。
+    initial_tab: Option<crate::ui::Tab>,
+    /// 托盘是否真的注册上了（没有 D-Bus 时关闭窗口就是退出）。
+    tray_active: bool,
     #[cfg(not(target_arch = "wasm32"))]
     capture: capture::CaptureState,
 }
@@ -148,7 +193,7 @@ impl VoicefoxGuiApp {
         self.cover_results = loader.results();
         let loader_dyn: Arc<dyn CoverLoader> = loader;
         self.cover_loader = Some(Arc::clone(&loader_dyn));
-        self.ui.tab = crate::ui::Tab::Search;
+        self.ui.tab = self.initial_tab.unwrap_or(crate::ui::Tab::Search);
         self.ui.set_cover_loader(loader_dyn);
         let mut controller = VoicefoxGuiController::new(&cc.egui_ctx, self.service.clone());
         if let Ok(path) = std::env::var("VOICEFOX_GUI_INPUT") {
@@ -161,6 +206,131 @@ impl VoicefoxGuiApp {
         // 封面加载运行时必须活到窗口关闭：挂到 App 自身，随它一起析构。
         self.cover_runtime = cover_runtime;
         self
+    }
+}
+
+impl VoicefoxGuiApp {
+    /// 每帧按 `[ui].appearance` 与桌面深浅色重算配色。
+    ///
+    /// 只有「强制/Auto 的结果」真的变化时才重算调色板：主题库解析一次
+    /// 要遍历全部具名主题，不该每帧都做。
+    fn apply_appearance(&mut self, ctx: &egui::Context, controller: &VoicefoxGuiController) {
+        let config = controller.config();
+        let appearance = config.ui.appearance;
+        let dark = resolve_dark(appearance, ctx);
+        let name = config.theme.name.clone();
+        let changed =
+            self.resolved.1 != dark || self.resolved.2 != appearance || self.resolved.3 != name;
+        if changed {
+            self.theme = GuiTheme::for_appearance(config, dark);
+            self.resolved = (self.theme, dark, appearance, name);
+            self.reported_dark = None;
+        }
+        // 桌面主题翻转后 egui 的默认视觉风格也要跟着换（未覆盖的部件）。
+        if self.reported_dark != Some(dark) {
+            self.reported_dark = Some(dark);
+            let mut visuals = self.theme.visuals_with(dark);
+            visuals.dark_mode = dark;
+            ctx.set_visuals(visuals);
+        }
+    }
+
+    /// GUI 兑现的全局快捷键子集（其余键位原样留给 TUI）。
+    ///
+    /// 只在没有文本输入框获得焦点时触发，否则会吞掉搜索框里的按键
+    /// （例如「/」本来就是进入搜索的键位）。
+    fn apply_keybindings(&mut self, ctx: &egui::Context, controller: &mut VoicefoxGuiController) {
+        use lx_core::keybinding::{Action, parse_keybinding};
+        use voicefox_application::ApplicationCommand;
+
+        if ctx.memory(|memory| memory.focused().is_some()) {
+            return;
+        }
+        // 本帧按下且没有重复触发的按键 + 当时的修饰键。
+        let pressed: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } => Some((*key, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        if pressed.is_empty() {
+            return;
+        }
+        let mut requests: Vec<GuiRequest> = Vec::new();
+        for action in crate::service::GUI_ACTIONS {
+            let Some(text) = controller.keybinding(action) else {
+                continue;
+            };
+            let Some(binding) = parse_keybinding(&text) else {
+                continue;
+            };
+            let gesture = binding.gesture();
+            let hit = pressed
+                .iter()
+                .any(|(key, modifiers)| keybinding_matches(gesture, *key, *modifiers));
+            if !hit {
+                continue;
+            }
+            requests.push(match action {
+                Action::GlobalPlayPause => GuiRequest::Dispatch(ApplicationCommand::Toggle),
+                Action::GlobalNextTrack => GuiRequest::Dispatch(ApplicationCommand::Next),
+                Action::GlobalPrevTrack => GuiRequest::Dispatch(ApplicationCommand::Previous),
+                Action::SearchInputMode => {
+                    self.ui.tab = crate::ui::Tab::Search;
+                    GuiRequest::RefreshSettings
+                }
+                _ => continue,
+            });
+        }
+        for request in requests {
+            controller.send(request);
+        }
+    }
+}
+
+/// 核心键位（与后端无关的 `KeyGesture`）与 egui 键事件是否一致。
+fn keybinding_matches(
+    gesture: lx_core::keybinding::KeyGesture,
+    key: egui::Key,
+    pressed: egui::Modifiers,
+) -> bool {
+    let mut wanted = egui::Modifiers::NONE;
+    if gesture.ctrl {
+        wanted |= egui::Modifiers::CTRL;
+        wanted |= egui::Modifiers::COMMAND;
+    }
+    if gesture.alt {
+        wanted |= egui::Modifiers::ALT;
+    }
+    // Shift 只在特殊键上参与比较：核心把 `Shift+a` 归一成 `A`，
+    // 打字时的 Shift 已体现在字符本身。
+    if gesture.character.is_none() && gesture.shift {
+        wanted |= egui::Modifiers::SHIFT;
+    }
+    if !pressed.matches_logically(wanted) {
+        return false;
+    }
+    match (gesture.character, gesture.special) {
+        (Some(character), _) => {
+            let typed = match key {
+                egui::Key::Space => Some(' '),
+                egui::Key::Slash => Some('/'),
+                other => other.name().chars().next(),
+            };
+            typed.is_some_and(|typed| typed == character || typed.eq_ignore_ascii_case(&character))
+        }
+        (None, Some(special)) => key.name() == special,
+        _ => false,
     }
 }
 
@@ -182,30 +352,51 @@ impl eframe::App for VoicefoxGuiApp {
         #[cfg(not(target_arch = "wasm32"))]
         capture::maybe_capture(&ctx, frame, &mut self.capture);
         let snapshot: Snapshot = self.service.take_snapshot();
-        let Some(controller) = self.controller.as_mut() else {
+        let Some(mut controller) = self.controller.take() else {
             return;
         };
         controller.apply_snapshot(snapshot);
         controller.tick_refresh();
+        // 外观与键位都要读控制器快照，先处理再借用一次画界面。
+        self.apply_appearance(&ctx, &controller);
+        self.apply_keybindings(&ctx, &mut controller);
+        if self.window_commands.take_show_settings() {
+            self.ui.tab = crate::ui::Tab::Settings;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.window_commands.take_toggle() {
+            let hidden = ctx.input(|input| input.viewport().visible()) == Some(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(hidden));
+            if hidden {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
         self.ui
-            .show(ui, controller, self.theme, &self.cover_results);
+            .show(ui, &mut controller, self.theme, &self.cover_results);
+        controller.send(GuiRequest::ReportAppearance {
+            dark: self.resolved.1,
+        });
+        self.controller = Some(controller);
 
-        if self.service.quit_requested() {
+        // 托盘是否可用由服务线程在启动时判断，这里只读结果。
+        let active = crate::service::tray_active() || self.tray_active;
+        // 关闭按钮 → 最小化到托盘：取消这次关闭，改成隐藏窗口。
+        // 真正的退出只由托盘「退出」/ MPRIS `Quit` / 服务线程退出触发。
+        if ctx.input(|input| input.viewport().close_requested())
+            && active
+            && !self.window_commands.quit_requested()
+            && !self.service.quit_requested()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        } else if self.service.quit_requested() || self.window_commands.quit_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         let _ = frame;
         // 进度条以 ~4Hz 刷新；封面加载完成时加载器自己请求重绘。
         ctx.request_repaint_after(Duration::from_millis(250));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn cover_runtime_can_be_built() {
-        // 封面加载运行时是纯 CPU/IO，构建失败会让封面永远空着。
-        let runtime = super::cover_runtime().expect("cover runtime");
-        drop(runtime);
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -268,4 +459,14 @@ mod capture {
 
     #[allow(dead_code)]
     fn _ensure_traits(_: &mut dyn Write) {}
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cover_runtime_can_be_built() {
+        // 封面加载运行时是纯 CPU/IO，构建失败会让封面永远空着。
+        let runtime = super::cover_runtime().expect("cover runtime");
+        drop(runtime);
+    }
 }

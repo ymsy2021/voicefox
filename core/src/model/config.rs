@@ -512,6 +512,11 @@ pub struct UiConfig {
     #[serde(default, skip_serializing)]
     pub notification_timeout: Option<u64>,
     pub max_fps: u32,
+    /// 桌面界面外观：`system` 跟随桌面深浅色，`light` / `dark` 强制。
+    ///
+    /// 只影响桌面 GUI（TUI 由终端配色决定）；默认「跟随系统」。
+    #[serde(default)]
+    pub appearance: Appearance,
     /// 底部状态栏中启用的字段，数组顺序即显示顺序。
     #[serde(
         default = "default_status_bar_items",
@@ -562,6 +567,57 @@ impl UiConfig {
     }
 }
 
+/// 桌面 GUI 的显示模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    /// 跟随桌面深浅色（egui 的系统主题通道）。
+    #[default]
+    System,
+    /// 始终浅色。
+    Light,
+    /// 始终深色。
+    Dark,
+}
+
+impl Appearance {
+    /// 解析配置/界面文本，非法值回到 [`Appearance::System`]。
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
+
+    /// 配置里的名字（与 serde 的 rename 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// 界面上的中文名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "跟随系统",
+            Self::Light => "强制浅色",
+            Self::Dark => "强制深色",
+        }
+    }
+
+    /// 是否强制深色；`System` 交给调用方按桌面结果决定。
+    pub fn forced_dark(self) -> Option<bool> {
+        match self {
+            Self::System => None,
+            Self::Light => Some(false),
+            Self::Dark => Some(true),
+        }
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -577,6 +633,7 @@ impl Default for UiConfig {
             cover_protocol: "auto".to_string(),
             show_notifications: None,
             notification_timeout: None,
+            appearance: Appearance::default(),
             max_fps: 20,
             status_bar_items: default_status_bar_items(),
             status_bar_height: default_status_bar_height(),

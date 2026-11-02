@@ -40,6 +40,11 @@ toml.workspace = true
 base64.workspace = true
 qrcode = { version = "0.4", default-features = false }
 
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+# 系统托盘：纯 Rust StatusNotifierItem（走 D-Bus，与 MPRIS 同一条路线，
+# 不引入 GTK/xdo 构建链），阻塞版自带线程。
+ksni = { version = "0.3", default-features = false, features = ["blocking", "tokio"] }
+
 [features]
 default = ["desktop-mpv"]
 desktop-mpv = ["voicefox-runtime/desktop-mpv"]
