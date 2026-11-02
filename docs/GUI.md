@@ -40,9 +40,13 @@ sudo apt install libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev libgl1-m
 | 播放模式 | ✅ 列表循环 / 单曲循环 / 随机 / 顺序 / 播完停止，停在结尾后可一键重新播放 |
 | 主题 | ✅ 跟随 `[theme]` 配置与主题库具名主题，与 TUI 同一份取色 |
 | TUI | ✅ 保留并共用核心；`cargo run` 行为不变 |
+| 设置页 | ✅ 播放音质（128k / 320k / FLAC / FLAC 24bit）、音量、下载音质、默认音源、主题、深浅色、快捷键；全部读写已有 `Config`，与 TUI 同一份 `config.toml` |
+| 系统托盘 | ✅ Linux（`ksni`，StatusNotifierItem / D-Bus）：显示 / 隐藏、播放 / 暂停、上一首、下一首、设置、退出；关闭窗口最小化到托盘 |
+| 主题跟随系统 | ✅ `[ui].appearance`：跟随系统 / 强制浅色 / 强制深色；具名主题按明暗换到同色相变体（如 `catppuccin-mocha` ↔ `catppuccin-latte`） |
 
-P2 尚未包含：系统托盘与最小化到托盘、主题跟随系统外观、完整设置页；
-Windows SMTC 与 macOS Now Playing 的 GUI 接入（TUI 侧仍保留这些平台后端）。
+P2 尚未包含：Windows / macOS 的系统托盘（`tray-icon` 需要额外原生构建链，本轮未接，
+这两个平台关闭窗口即退出）；Windows SMTC 与 macOS Now Playing 的 GUI 接入
+（TUI 侧仍保留这些平台后端）。
 
 发布资产：`.github/workflows/release.yml` 目前只打包 TUI 二进制（`voicefox`）。是否把
 `voicefox-gui` 一起放进各平台压缩包、以及 Linux 的 `libmpv-dev`/窗口库打包取舍，属于发布流程
@@ -87,8 +91,8 @@ cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 ### 界面快照
 
 `gui/tests/storyboard.rs` 用真实绘制 + 演示后端走一遍主要状态（空搜索 → 结果 →
-播放 → 队列 → 拖动排序 → 暂停/歌词 → 译文 → 收藏 → 歌单 → 扫码 → 下载），并断言界面
-文字。设 `VOICEFOX_GUI_SCREENSHOT=<目录>` 时每一步还会输出 PNG：
+播放 → 队列 → 拖动排序 → 暂停/歌词 → 译文 → 收藏 → 歌单 → 扫码 → 设置 → 浅色 → 下载），
+并断言界面文字。设 `VOICEFOX_GUI_SCREENSHOT=<目录>` 时每一步还会输出 PNG：
 
 ```bash
 VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard storyboard_renders -- --nocapture
@@ -115,6 +119,12 @@ VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard 
 - 歌单页暂不支持重命名与歌单内排序（核心已有 `rename_custom_playlist`，界面尚未接入）。
 - 扫码登录只展示二维码与轮询状态；登录成功后的账号昵称依赖音源返回（部分音源不返回）。
 - 下载「重试」= 重新入队当前曲目（去重索引保证已完成的不重复下载）。
+- 托盘只在 Linux 上实现（`ksni`，纯 Rust，走 D-Bus，与 MPRIS 同一条路线）；Windows / macOS
+  编译通过但没有托盘，关闭窗口直接退出。
+- GUI 兑现的快捷键只有播放 / 暂停、上一首、下一首、聚焦搜索四项；其余 `keybindings.global`
+  原样保留给 TUI。设置页会校验键位字符串（非法值不落盘）。
+- 浅色外观下 `voicefox` 手工槽位按明暗反转层次与正文色；具名主题换到同色相的浅色变体，
+  个别主题库没有浅色变体时回退到 `catppuccin-latte`。
 ## 验收记录
 
 - 界面截图：`gui/tests/storyboard.rs`（演示后端，无网络）与真实应用截图（`VOICEFOX_GUI_SCREENSHOT`）。
@@ -122,5 +132,7 @@ VOICEFOX_GUI_SCREENSHOT=/tmp/shots cargo test -p voicefox-gui --test storyboard 
 - TUI 不变性：同一份二进制启动后首屏的终端输出与改动前 `main` 逐字节相同
   （160×46 终端、空闲状态、无队列）；P1 分发层（下载搬到 runtime）后 TUI 仍正常启动。
 - P1 库操作：`gui/tests/library.rs` 用隔离数据目录验证「GUI 侧增删改查 = 共享 `Storage`」。
+- P2 设置：`gui/tests/config_write.rs` 用隔离配置路径验证「设置页改动 = `config.toml` 里的字段」，
+  非法主题 / 键位不落盘；`gui/tests/settings.rs` 覆盖音质名往返、键位校验、外观三态与托盘动作映射。
 - 真实链路：真实音源搜索（约 200 条结果）、播放、MPRIS 报告 `Playing` 与元数据/进度、
   D-Bus `PlayPause` / `Next` / `OpenUri` 在开发机上验证通过。
